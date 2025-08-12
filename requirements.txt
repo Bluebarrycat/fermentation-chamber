@@ -1,2 +1,3 @@
 gpiozero
 RPLCD
+smbus2
