@@ -6,7 +6,7 @@ from threading import Timer
 import sensors
 from config import SENSORS
 from ui import show_two_line, pause_menu
-from logger import log_data, 
+from logger import log_data
 from config import RECOMMENDED_BAND_WIDTH
 
 def run_calibration(hw, mode_name, low, high, loop_sec, window_min, target_c):
