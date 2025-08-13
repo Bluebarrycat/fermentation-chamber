@@ -1,140 +1,268 @@
-#!/usr/bin/env python3
+import os
 import time
-from collections import deque
 from statistics import mean
-from threading import Timer
-import sensors
-from config import SENSORS
-from ui import show_two_line, pause_menu
-from logger import log_data
-from config import RECOMMENDED_BAND_WIDTH
+from datetime import datetime
 
-def run_calibration(hw, mode_name, low, high, loop_sec, window_min, target_c):
+try:
+    import config_local as config  # site-specific overrides (gitignored)
+except Exception:
+    from . import config  # repo defaults
+
+from .sensors import read_temp
+from .io_hw import (
+    fans_on, fans_off,
+    motor_on_mode_a, motor_reverse_on, motor_off,
+    safe_stop, buttons_poll
+)
+from .logger import log_data
+from .ui import show_two_line
+
+# ---- Utilities ----
+
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def _btn_confirm_pressed(btn_state):
     """
-    Runs chamber with air setpoints (low/high).
-    Uses last window_min of data to compute AIR-SAMPLE offset and suggest Low/High for air.
-    Sample is used ONLY for recommendation, not for control.
+    buttons_poll() is expected to return a mapping of button states.
+    We normalize to a single truthy flag for Confirm.
+    """
+    if not btn_state:
+        return False
+    # Accept a few common spellings/keys
+    for k in ("confirm", "ok", "enter", "select"):
+        v = btn_state.get(k)
+        if isinstance(v, bool) and v:
+            return True
+        if isinstance(v, int) and v == 1:
+            return True
+    return False
+
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+# ---- Control helpers (mirror production logic per docs) ----
+
+def _apply_air_control(tmax, low, high, fan_after_off_sec):
+    """
+    Implements the production AIR-only control:
+      - If tmax > High → motor off, fans run-on after off
+      - If tmax >= High + 5 → reverse until <= High − 1
+      - If tmax <= Low → Mode A (forward), motor on, fans on
+    Returns tuple describing hardware state:
+      (motor_state: 'off'|'fwd'|'rev', reversing: bool, fans: bool, fan_hold_until: float|None)
     """
     reversing = False
-    motor_on = False
-    fan_timer = None
+    fans = False
+    fan_hold_until = None
+    motor_state = 'off'
 
-    def schedule_fans_off(delay):
-        nonlocal fan_timer
-        if fan_timer:
-            fan_timer.cancel()
-            fan_timer = None
-        fan_timer = Timer(delay, hw.fans_off)
-        fan_timer.start()
+    if tmax >= (high + 5.0):
+        motor_reverse_on()
+        fans_on()
+        reversing = True
+        fans = True
+        motor_state = 'rev'
+    elif tmax > high:
+        # stop motor, start fan run-on window
+        motor_off()
+        fans_on()
+        fans = True
+        fan_hold_until = time.monotonic() + float(fan_after_off_sec)
+        motor_state = 'off'
+    elif tmax <= low:
+        motor_on_mode_a()  # forward
+        fans_on()
+        fans = True
+        motor_state = 'fwd'
+    else:
+        # within band: motor off, fans possibly running due to previous hold
+        motor_off()
+        motor_state = 'off'
+        fans = False
 
-    # buffers sized by cadence
-    maxlen = max(1, int((window_min * 60) / loop_sec))
-    air_buf = deque(maxlen=maxlen)
-    sample_buf = deque(maxlen=maxlen)
+    return motor_state, reversing, fans, fan_hold_until
 
-    hw.motor_off()
-    hw.motor_set_dir(True)  # Mode A
-    hw.fans_off()
-    show_two_line(hw, f"Cal {mode_name}"[:16], "Confirm=Finish")
+def _maybe_stop_fans(fan_hold_until):
+    if fan_hold_until is None:
+        return None
+    if time.monotonic() >= fan_hold_until:
+        fans_off()
+        return None
+    return fan_hold_until
 
+# ---- Main calibration ----
+
+def run_calibration(mode_name: str):
+    """
+    Runs calibration for 'mode_name' for CAL_WINDOW_MIN minutes or until Confirm.
+    - Uses AIR sensors only for control decisions.
+    - Sample sensor is logged and used only for calibration math.
+    - Writes a report: logs/calibration_<mode>_<timestamp>.txt
+    - Displays a short summary on the LCD.
+    """
+
+    # --- Config & constants (fall back safely if any override missing) ---
+    CAL_MIN = int(getattr(config, "CAL_WINDOW_MIN", 120))
+    LOOP_SEC = float(getattr(config, "LOOP_SEC", 15.0))
+    FAN_AFTER_OFF_SEC = float(getattr(config, "FAN_AFTER_OFF_SEC", 10.0))
+    BAND_WIDTH = float(getattr(config, "RECOMMENDED_BAND_WIDTH", 1.0))
+    LOG_DIR = getattr(config, "LOG_DIR", "/home/rpizero/Ferment/logs")
+
+    # Per-mode default AIR band and target Sample temp.
+    # Your config module likely already has these; we defensively try to read them.
+    MODE_AIR_BANDS = getattr(config, "MODE_AIR_BANDS", {
+        # fallback examples; replace with your real defaults in config.py
+        "Sourdough": (22.0, 26.0),
+        "Kombucha": (24.0, 28.0),
+        "Water Kefir": (22.0, 27.0),
+    })
+    TARGET_SAMPLE = getattr(config, "TARGET_SAMPLE_C", {
+        # fallback examples; replace with your real defaults in config.py
+        "Sourdough": 24.0,
+        "Kombucha": 26.0,
+        "Water Kefir": 24.0,
+    })
+
+    air_low, air_high = MODE_AIR_BANDS.get(mode_name, (22.0, 26.0))
+    target_sample = TARGET_SAMPLE.get(mode_name, 24.0)
+
+    SENSOR1 = getattr(config, "SENSOR1_ID", "28-7db6d445e7a7")
+    SENSOR2 = getattr(config, "SENSOR2_ID", "28-37e5d44570c3")
+    SAMPLE  = getattr(config, "SAMPLE_ID",  "28-3ce1e3800798")
+
+    # --- Buffers for calibration math ---
+    air_buf = []
+    sample_buf = []
+
+    # --- Timing (robust) ---
+    start = time.monotonic()
+    deadline = start + CAL_MIN * 60.0
+
+    # --- LCD startup ---
+    show_two_line("Calibration", f"{mode_name}  {CAL_MIN} min")
+    time.sleep(1.2)
+
+    # Track fan run-on windows across iterations
+    fan_hold_until = None
+
+    # --- Main loop ---
     while True:
-        t1 = sensors.read_temp(SENSORS["Sensor1"])
-        t2 = sensors.read_temp(SENSORS["Sensor2"])
-        t_sample = sensors.read_temp(SENSORS["Sample"])
+        t1 = read_temp(SENSOR1)
+        t2 = read_temp(SENSOR2)
+        ts = read_temp(SAMPLE)
 
-        air_vals = [t for t in (t1, t2) if t is not None]
-        air = None if not air_vals else mean(air_vals)
+        # Pick max AIR (as per production rule-of-thumb for safety/response)
+        air_readings = [t for t in (t1, t2) if t is not None]
+        tmax = max(air_readings) if air_readings else None
 
-        # Brief UI
-        if air is not None and t_sample is not None:
-            show_two_line(hw, f"Cal {mode_name}"[:16], f"A:{air:.1f} S:{t_sample:.1f}")
+        # Apply production control policy (AIR-only), collect a possible fan run-on window
+        if tmax is not None:
+            motor_state, reversing, fans_now, fan_open = _apply_air_control(
+                tmax, air_low, air_high, FAN_AFTER_OFF_SEC
+            )
+            if fan_open is not None:
+                # Open/extend a fan hold window
+                fan_hold_until = fan_open if (fan_hold_until is None) else max(fan_hold_until, fan_open)
         else:
-            show_two_line(hw, f"Cal {mode_name}"[:16], "Waiting temps")
+            # No AIR data → fail safe to motor off, keep fans off unless a hold is active
+            motor_off()
+            motor_state = 'off'
+            reversing = False
+            fans_now = False
 
-        # Log as normal
-        dir_mode_a = (hw.motor_dir.value == False)
-        fans_on_state = (hw.fan1.value > 0 or hw.fan2.value > 0)
-        log_data(f"CAL-{mode_name}", t1, t2, t_sample, motor_on, dir_mode_a, fans_on_state, reversing)
+        # Maintain any active fan hold window
+        fan_hold_until = _maybe_stop_fans(fan_hold_until)
 
-        # Control uses AIR only
-        if air is not None:
-            if not reversing and air >= high + 5:
-                reversing = True
-                hw.motor_reverse_on()
-                hw.fans_on()
-            if reversing and air <= high - 1:
-                reversing = False
-                hw.motor_off()
-                schedule_fans_off(10)
-                motor_on = False
-                hw.motor_set_dir(True)
+        # Log row (even if temps are None; CSV will capture diagnostics)
+        log_data(
+            mode=f"CAL-{mode_name}",
+            t1=t1,
+            t2=t2,
+            t_sample=ts,
+            motor_on=(motor_state != 'off'),
+            dir_mode_a=(motor_state == 'fwd'),
+            fans_on=(fans_now or (fan_hold_until is not None)),
+            reversing=reversing
+        )
 
-            if not reversing:
-                if motor_on and air > high:
-                    hw.motor_off()
-                    motor_on = False
-                    hw.fans_on()
-                    schedule_fans_off(10)
-                if (not motor_on) and air <= low:
-                    hw.motor_set_dir(True)
-                    hw.motor_on_mode_a()
-                    motor_on = True
-                    hw.fans_on()
+        # Append to buffers for calibration math (only if values exist)
+        if tmax is not None:
+            air_buf.append(tmax)
+        if ts is not None:
+            sample_buf.append(ts)
 
-        # add to buffers
-        if air is not None: air_buf.append(air)
-        if t_sample is not None: sample_buf.append(t_sample)
+        # LCD status
+        line1 = f"AIR {tmax:.1f}  S {ts:.1f}" if (tmax is not None and ts is not None) else "Reading sensors..."
+        # Remaining minutes rounded up for display niceness
+        remain_s = max(0.0, deadline - time.monotonic())
+        remain_min = int(remain_s // 60.0)
+        line2 = f"{mode_name} {remain_min:>3}m  C=Stop"
+        show_two_line(line1, line2)
 
-        # finish on Confirm
-        if hw.btn_ok.is_pressed:
-            time.sleep(0.2)
+        # Early exit on Confirm
+        btns = buttons_poll()
+        if _btn_confirm_pressed(btns):
             break
 
-        # responsive pause
-        for _ in range(max(1, int(loop_sec / 0.1))):
-            btn = hw.buttons_poll()
-            if btn == "LEFT":
-                choice = pause_menu(hw)
-                if choice == "resume":
-                    break
-                if choice == "change":
-                    if fan_timer: fan_timer.cancel()
-                    hw.safe_stop()
-                    return "change"
-                if choice == "shutdown":
-                    return "shutdown"
-            time.sleep(0.1)
+        # End‑time exit
+        if time.monotonic() >= deadline:
+            break
 
-    # compute recommendation
-    if len(air_buf) == 0 or len(sample_buf) == 0:
-        show_two_line(hw, "Cal failed", "No data"); time.sleep(2); return "change"
+        # Small, regular cycle delay (non‑blocking for button checks)
+        time.sleep(_clamp(LOOP_SEC, 0.5, 60.0))
 
-    air_avg = mean(air_buf)
-    sample_avg = mean(sample_buf)
-    offset = air_avg - sample_avg
-    center = target_c + offset
-    half = RECOMMENDED_BAND_WIDTH / 2.0
-    rec_low, rec_high = center - half, center + half
+    # --- End of run: compute results & write report ---
+    # Basic guards if data is sparse
+    if air_buf and sample_buf:
+        air_avg = mean(air_buf)
+        sample_avg = mean(sample_buf)
+        offset = air_avg - sample_avg  # positive if AIR hotter than Sample
 
-    # Save report
-    from datetime import datetime
-    import os
-    from config import LOG_DIR
-    os.makedirs(LOG_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = os.path.join(LOG_DIR, f"calibration_{mode_name}_{ts}.txt")
-    with open(path, "w") as f:
-        f.write(f"Calibration Report - {mode_name}\n")
-        f.write(f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n\n")
-        f.write(f"Target SAMPLE temperature: {target_c:.2f} °C\n")
-        f.write(f"Window length: {window_min} minutes\n\n")
-        f.write(f"Average AIR (mean of Sensor1 & Sensor2): {air_avg:.2f} °C\n")
-        f.write(f"Average SAMPLE: {sample_avg:.2f} °C\n")
-        f.write(f"Computed offset (AIR - SAMPLE): {offset:.2f} °C\n\n")
-        f.write(f"Recommended AIR setpoints:\n")
-        f.write(f"  Low:  {rec_low:.2f} °C\n")
-        f.write(f"  High: {rec_high:.2f} °C\n")
+        # Target AIR center to hold the desired Sample
+        center_air = target_sample + offset
+        half_bw = BAND_WIDTH / 2.0
+        rec_low = center_air - half_bw
+        rec_high = center_air + half_bw
+    else:
+        air_avg = sample_avg = offset = center_air = rec_low = rec_high = None
 
-    show_two_line(hw, "Cal done", f"L:{rec_low:.1f} H:{rec_high:.1f}")
-    time.sleep(4)
-    return "change"
+    # Report file
+    _ensure_dir(LOG_DIR)
+    report_path = os.path.join(LOG_DIR, f"calibration_{mode_name}_{_now_str()}.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"Mode: {mode_name}\n")
+        f.write(f"Window (min): {CAL_MIN}\n")
+        f.write(f"Samples (AIR): {len(air_buf)}\n")
+        f.write(f"Samples (Sample): {len(sample_buf)}\n")
+        if air_avg is not None:
+            f.write(f"Average AIR: {air_avg:.3f} C\n")
+            f.write(f"Average Sample: {sample_avg:.3f} C\n")
+            f.write(f"Offset (AIR - Sample): {offset:.3f} C\n")
+            f.write(f"Target Sample: {target_sample:.3f} C\n")
+            f.write(f"Recommended center AIR: {center_air:.3f} C\n")
+            f.write(f"Recommended Low/High (±{BAND_WIDTH/2:.3f}): {rec_low:.3f} / {rec_high:.3f} C\n")
+        else:
+            f.write("Insufficient data to compute recommendations.\n")
+
+    # Brief summary on LCD
+    if air_avg is not None:
+        show_two_line("Cal complete", f"{rec_low:.1f}–{rec_high:.1f} C")
+    else:
+        show_two_line("Cal complete", "No recommendation")
+
+    # Ensure hardware is safe when leaving
+    motor_off()
+    fans_off()
+    safe_stop()
+
+    return {
+        "report": report_path,
+        "air_avg": air_avg,
+        "sample_avg": sample_avg,
+        "offset": offset,
+        "recommended": (rec_low, rec_high) if air_avg is not None else None,
+    }
