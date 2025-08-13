@@ -1,0 +1,15 @@
+[Unit]
+Description=Fermentation Chamber Controller
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rpizero/Ferment
+ExecStart=/home/rpizero/Ferment/venv/bin/python /home/rpizero/Ferment/main.py
+Restart=always
+User=rpizero
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
