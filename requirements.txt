@@ -1,5 +1,0 @@
-gpiozero
-RPLCD
-smbus2
-lgpio
-
