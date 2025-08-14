@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import time
 import os
+import json
 import subprocess
 import csv
 from datetime import datetime
@@ -24,7 +25,9 @@ CAL_TARGET_C = {                # target SAMPLE temperature per mode (adjust if 
 }
 RECOMMENDED_BAND_WIDTH = 1.0    # °C total band for air setpoints during recommendation
 
-LOG_DIR = "/home/rpizero/Ferment/logs"
+BASE_DIR_APP = "/home/rpizero/Ferment"
+LOG_DIR = os.path.join(BASE_DIR_APP, "logs")
+CAL_FILE = os.path.join(BASE_DIR_APP, "calibration_setpoints.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # =========================
@@ -60,7 +63,7 @@ SENSORS = {
 }
 
 # =========================
-# Menus & ranges
+# Menus & ranges (defaults)
 # =========================
 MENU = [
     'Sourdough', 'Kombucha', 'Water Kefir',
@@ -80,6 +83,45 @@ motor_on = False
 reversing = False
 fan_off_timer = None
 request_pause_menu = False
+
+# =========================
+# Persistence (calibration setpoints)
+# =========================
+def load_calibration_setpoints():
+    """Load saved setpoints from CAL_FILE and merge into RANGES (if present)."""
+    if not os.path.exists(CAL_FILE):
+        return
+    try:
+        with open(CAL_FILE, "r") as f:
+            data = json.load(f)
+        changed = False
+        for mode, vals in data.items():
+            if isinstance(vals, dict) and "low" in vals and "high" in vals:
+                low = float(vals["low"]); high = float(vals["high"])
+                if mode in RANGES and (low, high) != RANGES[mode]:
+                    RANGES[mode] = (low, high)
+                    changed = True
+        if changed:
+            show_two_line("Loaded saved", "cal setpoints")
+            time.sleep(1.2)
+    except Exception as e:
+        show_two_line("Cal file error", "Using defaults")
+        time.sleep(1.5)
+
+def save_calibration_setpoints(mode_name, low, high):
+    """Persist setpoints to CAL_FILE (per-mode)."""
+    data = {}
+    if os.path.exists(CAL_FILE):
+        try:
+            with open(CAL_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data[mode_name] = {"low": round(low, 2), "high": round(high, 2)}
+    tmp = CAL_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CAL_FILE)
 
 # =========================
 # Logging
@@ -139,6 +181,7 @@ def write_calibration_report(mode, target, air_avg, sample_avg, offset, rec_low,
         f.write(f"Recommended AIR setpoints:\n")
         f.write(f"  Low:  {rec_low:.2f} °C\n")
         f.write(f"  High: {rec_high:.2f} °C\n")
+        f.write("\nPersisted to: calibration_setpoints.json\n")
     return path
 
 # =========================
@@ -288,7 +331,7 @@ def run_mode(mode_name, low, high):
             status_display(mode_name, 0.0, high)
             log_data(mode_name, t1, t2, t_sample, motor_on, motor_dir.value, fan1.value > 0 or fan2.value > 0, reversing)
         else:
-            tmax = max(temps); tmin = min(temps)
+            tmax = max(temps)
             status_display(mode_name, tmax, high)
             log_data(mode_name, t1, t2, t_sample, motor_on, motor_dir.value, fan1.value > 0 or fan2.value > 0, reversing)
 
@@ -339,6 +382,7 @@ def run_calibration(mode_name, low, high):
     - Ends when Confirm is pressed OR when CAL_WINDOW_MIN elapses.
     - Uses last CAL_WINDOW_MIN of data (or all available if shorter).
     - Sample is USED here to compute offset; still ignored for control itself.
+    - On finish: computes recommendation, SAVES to disk, APPLIES in memory, returns to menu.
     """
     global motor_on, reversing, request_pause_menu
 
@@ -447,9 +491,13 @@ def run_calibration(mode_name, low, high):
         half = RECOMMENDED_BAND_WIDTH / 2.0
         rec_low, rec_high = center - half, center + half
 
+        # Save & apply
+        save_calibration_setpoints(mode_name, rec_low, rec_high)
+        RANGES[mode_name] = (rec_low, rec_high)
+
         # Save report & show on LCD
         write_calibration_report(mode_name, target, air_avg, sample_avg, offset, rec_low, rec_high)
-        show_two_line("Cal done", f"L:{rec_low:.1f} H:{rec_high:.1f}")
+        show_two_line("Cal saved+applied", f"L:{rec_low:.1f} H:{rec_high:.1f}")
         time.sleep(4)
         return "change"
 
@@ -472,6 +520,7 @@ def main_menu():
                 shutdown_now(); return ('shutdown',)
             elif choice.startswith('Cal '):
                 base = choice.replace('Cal ', '')
+                # Always use current (possibly loaded) setpoints:
                 low, high = RANGES[base]
                 return ('cal', base, low, high)
             else:
@@ -479,6 +528,7 @@ def main_menu():
                 return ('mode', choice, low, high)
 
 def main():
+    load_calibration_setpoints()  # merge any saved setpoints before anything else
     init_log()
     while True:
         sel = main_menu()
