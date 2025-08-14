@@ -336,109 +336,126 @@ def run_calibration(mode_name, low, high):
     """
     Calibration mode:
     - Runs chamber with current air setpoints (low/high).
-    - Press Confirm to finish; computes recommended air setpoints
-      to hold CAL_TARGET_C[mode_name] on SAMPLE.
+    - Ends when Confirm is pressed OR when CAL_WINDOW_MIN elapses.
     - Uses last CAL_WINDOW_MIN of data (or all available if shorter).
     - Sample is USED here to compute offset; still ignored for control itself.
     """
     global motor_on, reversing, request_pause_menu
 
-    target = CAL_TARGET_C.get(mode_name, 25.0)
-    motor_dir.value = False
-    motor_on = False; reversing = False
-    cancel_fan_timer(); fans_off()
+    # --- edge-triggered Confirm handler for reliable finish ---
+    finish_requested = False
+    def _on_confirm():
+        nonlocal finish_requested
+        finish_requested = True
 
-    # buffers store most recent CAL_WINDOW_MIN minutes at LOOP_INTERVAL cadence
-    maxlen = max(1, int((CAL_WINDOW_MIN * 60) / LOOP_INTERVAL_SEC))
-    air_buf = deque(maxlen=maxlen)     # mean of Sensor1 & Sensor2
-    sample_buf = deque(maxlen=maxlen)
+    old_confirm_handler = button_confirm.when_pressed
+    button_confirm.when_pressed = _on_confirm
 
-    # UI
-    show_two_line(f"Cal {mode_name}"[:16], "Confirm=Finish")
+    try:
+        target = CAL_TARGET_C.get(mode_name, 25.0)
+        motor_dir.value = False
+        motor_on = False; reversing = False
+        cancel_fan_timer(); fans_off()
 
-    while True:
-        t1 = read_temp(SENSORS['Sensor1'])
-        t2 = read_temp(SENSORS['Sensor2'])
-        t_sample = read_temp(SENSORS['Sample'])
+        # buffers store most recent CAL_WINDOW_MIN minutes at LOOP_INTERVAL cadence
+        maxlen = max(1, int((CAL_WINDOW_MIN * 60) / LOOP_INTERVAL_SEC))
+        air_buf = deque(maxlen=maxlen)     # mean of Sensor1 & Sensor2
+        sample_buf = deque(maxlen=maxlen)
 
-        air_vals = [t for t in (t1, t2) if t is not None]
-        air = None if not air_vals else (mean(air_vals))
+        start_ts = time.time()
+        # UI
+        show_two_line(f"Cal {mode_name}"[:16], "Confirm=Finish")
 
-        # Short status
-        if air is not None and t_sample is not None:
-            show_two_line(f"Cal {mode_name}"[:16], f"A:{air:.1f} S:{t_sample:.1f}")
-        else:
-            show_two_line(f"Cal {mode_name}"[:16], "Waiting temps")
+        while True:
+            t1 = read_temp(SENSORS['Sensor1'])
+            t2 = read_temp(SENSORS['Sensor2'])
+            t_sample = read_temp(SENSORS['Sample'])
 
-        # Log as normal
-        log_data(f"CAL-{mode_name}", t1, t2, t_sample, motor_on, motor_dir.value, fan1.value > 0 or fan2.value > 0, reversing)
+            air_vals = [t for t in (t1, t2) if t is not None]
+            air = None if not air_vals else (mean(air_vals))
 
-        # Control follows the same air-band rules (Sample NOT used for control)
-        if air is not None:
-            if not reversing and air >= high + 5:
-                reversing = True
-                motor_dir.value = not motor_dir.value
-                motor_pwm.value = 1.0
-                cancel_fan_timer(); fans_on()
-            if reversing and air <= high - 1:
-                reversing = False
-                motor_pwm.value = 0.0
-                schedule_fan_off()
-                motor_on = False
-                motor_dir.value = False
+            # Short status
+            if air is not None and t_sample is not None:
+                show_two_line(f"Cal {mode_name}"[:16], f"A:{air:.1f} S:{t_sample:.1f}")
+            else:
+                show_two_line(f"Cal {mode_name}"[:16], "Waiting temps")
 
-            if not reversing:
-                if motor_on and air > high:
-                    motor_pwm.value = 0.0
-                    motor_on = False
-                    cancel_fan_timer(); fans_on()
-                    schedule_fan_off()
-                if not motor_on and air <= low:
-                    motor_dir.value = False
+            # Log as normal
+            log_data(f"CAL-{mode_name}", t1, t2, t_sample, motor_on, motor_dir.value, fan1.value > 0 or fan2.value > 0, reversing)
+
+            # Control follows the same air-band rules (Sample NOT used for control)
+            if air is not None:
+                if not reversing and air >= high + 5:
+                    reversing = True
+                    motor_dir.value = not motor_dir.value
                     motor_pwm.value = 1.0
-                    motor_on = True
                     cancel_fan_timer(); fans_on()
+                if reversing and air <= high - 1:
+                    reversing = False
+                    motor_pwm.value = 0.0
+                    schedule_fan_off()
+                    motor_on = False
+                    motor_dir.value = False
 
-        # Add to buffers (only if we have readings)
-        if air is not None: air_buf.append(air)
-        if t_sample is not None: sample_buf.append(t_sample)
+                if not reversing:
+                    if motor_on and air > high:
+                        motor_pwm.value = 0.0
+                        motor_on = False
+                        cancel_fan_timer(); fans_on()
+                        schedule_fan_off()
+                    if not motor_on and air <= low:
+                        motor_dir.value = False
+                        motor_pwm.value = 1.0
+                        motor_on = True
+                        cancel_fan_timer(); fans_on()
 
-        # Finish calibration on Confirm
-        if button_confirm.is_pressed:
-            time.sleep(0.2)  # debounce
-            break
+            # Add to buffers (only if we have readings)
+            if air is not None: air_buf.append(air)
+            if t_sample is not None: sample_buf.append(t_sample)
 
-        # Allow Pause menu with Left
-        for _ in range(int(LOOP_INTERVAL_SEC / 0.1)):
-            if request_pause_menu:
-                choice = pause_menu()
-                if choice == "resume":
-                    request_pause_menu = False; break
-                elif choice == "change":
-                    request_pause_menu = False; safe_stop(); return "change"
-                elif choice == "shutdown":
-                    shutdown_now(); return "shutdown"
-            time.sleep(0.1)
+            # --- Finish conditions ---
+            elapsed = time.time() - start_ts
+            if finish_requested or elapsed >= CAL_WINDOW_MIN * 60:
+                break
 
-    # Compute recommendation (Sample USED here)
-    if len(air_buf) == 0 or len(sample_buf) == 0:
-        show_two_line("Cal failed", "No data")
-        time.sleep(2)
+            # Allow Pause menu with Left; also check finish flag frequently
+            for _ in range(int(LOOP_INTERVAL_SEC / 0.1)):
+                if finish_requested:
+                    break
+                if request_pause_menu:
+                    choice = pause_menu()
+                    if choice == "resume":
+                        request_pause_menu = False; break
+                    elif choice == "change":
+                        request_pause_menu = False; safe_stop(); return "change"
+                    elif choice == "shutdown":
+                        shutdown_now(); return "shutdown"
+                time.sleep(0.1)
+            if finish_requested:
+                break
+
+        # Compute recommendation (Sample USED here)
+        if len(air_buf) == 0 or len(sample_buf) == 0:
+            show_two_line("Cal failed", "No data")
+            time.sleep(2)
+            return "change"
+
+        air_avg = mean(air_buf)
+        sample_avg = mean(sample_buf)
+        offset = air_avg - sample_avg           # positive if air hotter than sample
+        center = target + offset                # desired air avg to hold target sample
+        half = RECOMMENDED_BAND_WIDTH / 2.0
+        rec_low, rec_high = center - half, center + half
+
+        # Save report & show on LCD
+        write_calibration_report(mode_name, target, air_avg, sample_avg, offset, rec_low, rec_high)
+        show_two_line("Cal done", f"L:{rec_low:.1f} H:{rec_high:.1f}")
+        time.sleep(4)
         return "change"
 
-    air_avg = mean(air_buf)
-    sample_avg = mean(sample_buf)
-    offset = air_avg - sample_avg           # positive if air hotter than sample
-    center = CAL_TARGET_C.get(mode_name, 25.0) + offset  # desired air avg to hold target sample
-    half = RECOMMENDED_BAND_WIDTH / 2.0
-    rec_low, rec_high = center - half, center + half
-
-    # Save report & flash on LCD
-    write_calibration_report(mode_name, CAL_TARGET_C.get(mode_name, 25.0),
-                             air_avg, sample_avg, offset, rec_low, rec_high)
-    show_two_line("Cal done", f"L:{rec_low:.1f} H:{rec_high:.1f}")
-    time.sleep(4)
-    return "change"
+    finally:
+        # restore previous handler to avoid side-effects outside calibration
+        button_confirm.when_pressed = old_confirm_handler
 
 def main_menu():
     idx = 0
