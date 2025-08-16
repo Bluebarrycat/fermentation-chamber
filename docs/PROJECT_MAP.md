@@ -26,7 +26,8 @@ Ferment/
     ├─ ENVIRONMENT_SETUP.md
     ├─ SYNC_WORKFLOW.md
     ├─ AI_COLLAB.md
-    └─ TEMPLATES.md
+    ├─ TEMPLATES.md
+    └─ github_update_cheat_sheet.md
 ```
 
 ---
