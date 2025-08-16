@@ -54,6 +54,26 @@ git push origin dev
 
 ---
 
+## Branch Merging
+
+### Merge `main` into `dev` (bring stable changes into dev for further work)
+```bash
+git checkout dev
+git pull origin dev
+git merge main
+git push origin dev
+```
+
+### Merge `dev` into `main` (promote tested changes to stable)
+```bash
+git checkout main
+git pull origin main
+git merge dev
+git push origin main
+```
+
+---
+
 ## Notes
 - Always **pull before pushing** to avoid conflicts:
   ```bash

@@ -32,6 +32,12 @@ BOOST_ENABLE = True
 BOOST_DELTA_C = 3.0             # Enter Boost if AIR <= (band_center - BOOST_DELTA_C)
 BOOST_EXIT_GAP_C = 1.5          # Exit Boost once AIR >= (band_center - BOOST_EXIT_GAP_C)
 BOOST_MAX_AIR_C = 31.0          # Safety: do not allow AIR to exceed this while boosting
+# --- Outlier rejection (AIR sensors) ---
+OUTLIER_DELTA_C = 2.5          # suspect if a reading jumps > 2.5 °C from its EMA (" >2–3 ")
+OUTLIER_CONSECUTIVE = 3        # consecutive suspect readings before we ignore a sensor
+OUTLIER_REJOIN_MIN = 5 * 60    # after being ignored, must behave this many seconds to rejoin
+EMA_ALPHA = 0.2                # per-sensor EMA smoothing factor (0.1–0.3 typical)
+
 
 BASE_DIR_APP = "/home/rpizero/Ferment"
 LOG_DIR = os.path.join(BASE_DIR_APP, "logs")
@@ -224,6 +230,111 @@ def read_temp(sensor_id):
     except:
         return None
 
+
+# --- Sensor voting & outlier rejection helpers ---
+_air_ema = {}            # sensor_id -> float (EMA °C)
+_air_bad = {}            # sensor_id -> bool
+_air_bad_since = {}      # sensor_id -> epoch seconds when it was marked bad
+_air_suspect_count = {}  # sensor_id -> int
+
+def _ema_update(sensor_id: str, value_c: float) -> float:
+    prev = _air_ema.get(sensor_id, value_c)
+    ema = (1.0 - EMA_ALPHA) * prev + EMA_ALPHA * value_c
+    _air_ema[sensor_id] = ema
+    return ema
+
+def _log_outlier_event(msg: str):
+    try:
+        print(f"[OUTLIER] {msg}")
+        # If you have structured event logging, call it here, e.g.:
+        # write_event("AIR_OUTLIER", msg)
+    except Exception:
+        pass
+
+def _lcd_flash_warning(line1: str, line2: str = "", seconds: float = 2.0):
+    try:
+        lcd.clear()
+        lcd.write_string(line1[:16])
+        if line2:
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(line2[:16])
+        time.sleep(seconds)
+        # If you have a render_status() or similar, call it here to restore normal screen.
+        # render_status()
+    except Exception:
+        pass
+
+def _mark_bad(sensor_id: str):
+    if not _air_bad.get(sensor_id, False):
+        _air_bad[sensor_id] = True
+        _air_bad_since[sensor_id] = time.time()
+        _log_outlier_event(f"SENSOR_MARK_BAD {sensor_id}")
+        _lcd_flash_warning("AIR OUTLIER", sensor_id[-4:].upper())
+
+def _maybe_rejoin(sensor_id: str, ok_now: bool):
+    """Let a sensor rejoin after cooldown if readings look sane again."""
+    if _air_bad.get(sensor_id, False):
+        if time.time() - _air_bad_since.get(sensor_id, 0) >= OUTLIER_REJOIN_MIN and ok_now:
+            _air_bad[sensor_id] = False
+            _air_suspect_count[sensor_id] = 0
+            _log_outlier_event(f"SENSOR_REJOIN {sensor_id}")
+            _lcd_flash_warning("AIR SENSOR OK", sensor_id[-4:].upper())
+
+def compute_air_with_outlier(a1_c, a2_c, sensor1_id, sensor2_id):
+    """
+    Returns (air_c, used_sensors_list)
+    - EMA detects abrupt per-sensor jumps.
+    - If one sensor is persistently suspect, we ignore it for OUTLIER_REJOIN_MIN.
+    - If both are good, average. If one is bad, use the other. If both bad, mean fallback.
+    """
+    # Update EMA and deviations
+    ema1 = _ema_update(sensor1_id, a1_c) if a1_c is not None else _air_ema.get(sensor1_id, None)
+    ema2 = _ema_update(sensor2_id, a2_c) if a2_c is not None else _air_ema.get(sensor2_id, None)
+    dev1 = abs(a1_c - ema1) if (a1_c is not None and ema1 is not None) else 0.0
+    dev2 = abs(a2_c - ema2) if (a2_c is not None and ema2 is not None) else 0.0
+
+    sus1_now = (a1_c is not None and ema1 is not None and dev1 > OUTLIER_DELTA_C)
+    sus2_now = (a2_c is not None and ema2 is not None and dev2 > OUTLIER_DELTA_C)
+
+    # Only count suspect sequences when sensor has a real reading
+    if a1_c is not None and not _air_bad.get(sensor1_id, False):
+        _air_suspect_count[sensor1_id] = (_air_suspect_count.get(sensor1_id, 0) + 1) if sus1_now else 0
+        if _air_suspect_count[sensor1_id] >= OUTLIER_CONSECUTIVE:
+            _mark_bad(sensor1_id)
+    if a2_c is not None and not _air_bad.get(sensor2_id, False):
+        _air_suspect_count[sensor2_id] = (_air_suspect_count.get(sensor2_id, 0) + 1) if sus2_now else 0
+        if _air_suspect_count[sensor2_id] >= OUTLIER_CONSECUTIVE:
+            _mark_bad(sensor2_id)
+
+    # Allow rejoin after cooldown if current reading looks okay (or no reading, don't rejoin)
+    if a1_c is not None:
+        _maybe_rejoin(sensor1_id, ok_now=not sus1_now)
+    if a2_c is not None:
+        _maybe_rejoin(sensor2_id, ok_now=not sus2_now)
+
+    s1_bad = _air_bad.get(sensor1_id, False)
+    s2_bad = _air_bad.get(sensor2_id, False)
+
+    # Choose value
+    if (a1_c is None) and (a2_c is None):
+        return None, []
+
+    if s1_bad and not s2_bad and a2_c is not None:
+        return (a2_c, [sensor2_id])
+    elif s2_bad and not s1_bad and a1_c is not None:
+        return (a1_c, [sensor1_id])
+    elif not s1_bad and not s2_bad:
+        # Both good (or not flagged): average of available readings
+        vals = [v for v in (a1_c, a2_c) if v is not None]
+        return (sum(vals) / len(vals), [sensor1_id if a1_c is not None else None, sensor2_id if a2_c is not None else None])
+    else:
+        # Both bad or ambiguous: fallback to mean of available readings
+        vals = [v for v in (a1_c, a2_c) if v is not None]
+        if not vals:
+            return None, []
+        _log_outlier_event("BOTH_SENSORS_SUSPECT — using mean temporarily")
+        return (sum(vals) / len(vals), [])
+
 def fans_on():
     fan1.value = FAN_SPEED
     fan2.value = FAN_SPEED
@@ -336,8 +447,7 @@ def _read_air_and_sample():
     t1 = read_temp(SENSORS['Sensor1'])
     t2 = read_temp(SENSORS['Sensor2'])
     t_sample = read_temp(SENSORS['Sample'])  # read + log only (never used for control)
-    air_vals = [t for t in (t1, t2) if t is not None]
-    air = None if not air_vals else (mean(air_vals))
+    air, used = compute_air_with_outlier(t1, t2, SENSORS['Sensor1'], SENSORS['Sensor2'])
     return t1, t2, t_sample, air
 
 def _apply_emergency_reverse(tmax, high):
