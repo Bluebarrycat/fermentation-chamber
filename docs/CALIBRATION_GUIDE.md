@@ -2,14 +2,13 @@
 
 ## Overview
 This guide provides step-by-step instructions for running calibration for **Sourdough**, **Kombucha**, and **Water Kefir** in the fermentation control system.
-
 The calibration process measures environmental and product-specific temperature offsets to ensure accurate readings during operation.
 
 ---
 
 ## Duration
-- **Standard Duration**: 200 minutes (3 hours 20 minutes)  
-- You may stop early if readings are stable and representative, but avoid stopping before 100 minutes unless necessary.
+- **Standard Duration**: 200 minutes (3 hours 20 minutes)
+- You may stop early if readings are stable and representative, but avoid stopping before **100 minutes** unless necessary.
 
 ---
 
@@ -37,8 +36,8 @@ The calibration process measures environmental and product-specific temperature 
 - You can view progress in real time from a networked computer.
 
 ### 4. Stopping Calibration Early
-- Press the confirm button to end calibration before the 200-minute mark.
-- Only stop early if temperatures have stabilized for at least 25 minutes.
+- Press the confirm button to end calibration before the **200-minute** mark.
+- Only stop early if temperatures have stabilized for at least **25 minutes**.
 
 ### 5. Interpreting Results
 1. Review the logged CSV file after calibration ends.
@@ -46,12 +45,19 @@ The calibration process measures environmental and product-specific temperature 
 3. Calculate the offset between target and measured values.
 
 ### 6. Updating Configuration
-1. Open the configuration file (e.g., `config.json` or relevant settings module).
-2. Apply sensor offsets based on calibration results.
+1. Open the configuration file or run-time settings (e.g., `calibration_setpoints.json` produced by the app).
+2. Apply sensor offsets/setpoints based on calibration results.
 3. Save the file and restart the `ferment.service`:
    ```bash
    sudo systemctl restart ferment.service
    ```
+
+---
+
+### Boost → Hold During Calibration
+- When AIR is far below the current band center, the controller uses a **Boost phase** to approach temperature more quickly, capped by a safe AIR limit (`BOOST_MAX_AIR_C`, default **31.0 °C**).
+- Once near the center, control reverts to the normal **Hold** band logic.
+- **Important:** Even in calibration, **Sample** is **not** used for control — it is only used to compute the AIR↔Sample offset for the recommendation.
 
 ---
 

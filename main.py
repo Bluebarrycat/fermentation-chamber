@@ -19,7 +19,7 @@ LOOP_INTERVAL_SEC = 15          # main control cadence
 FAN_AFTER_OFF_SEC = 10          # fans run this long after motor turns off due to High
 CAL_WINDOW_MIN = 200            # minutes of data used for final calibration window
 CAL_TARGET_C = {                # target SAMPLE temperature per mode (adjust if needed)
-    'Sourdough': 25.0,
+    'Sourdough': 27.0,
     'Kombucha':  25.0,
     'Water Kefir': 25.0,
 }
