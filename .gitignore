@@ -1,0 +1,32 @@
+# --- Python artifacts ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.so
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Logs and runtime data ---
+logs/
+*.log
+calibration_*.txt
+*.csv
+
+# --- Local-only config (do not commit) ---
+config_local.py
+calibration_setpoints.json
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Backup files ---
+*~
+*.bak
