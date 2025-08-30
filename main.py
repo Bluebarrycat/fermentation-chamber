@@ -121,17 +121,20 @@ def write_calibration_report(mode,target,air_avg,sample_avg,offset,rec_low,rec_h
     return path
 
 
+
 def delete_old_cal_reports_for_mode(mode_name: str):
-    """Remove existing calibration_<mode>* reports for a clean start of this calibration type only."""
+    """Remove existing calibration reports for *this* product only, case-insensitive.
+    Matches both 'calibration_Sourdough*.txt' and 'calibration_sourdough*.txt' styles.
+    """
     try:
-        # Normalize mode into filename form used by reports
         key = mode_name.strip().lower().replace(' ', '_')
-        pattern = f'calibration_{key}*.txt'
-        for p in Path(LOG_DIR).glob(pattern):
-            try:
-                p.unlink()
-            except Exception:
-                pass
+        for p in Path(LOG_DIR).glob('calibration_*.txt'):
+            name_l = p.name.lower()
+            if name_l.startswith(f'calibration_{key}'):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -158,6 +161,17 @@ def show_two_line(a,b):
     lcd.clear(); lcd.write_string(a[:16]); lcd.cursor_pos=(1,0); lcd.write_string(b[:16])
 def show_menu(options,index):
     show_two_line(f'> {options[index][:14]}', f'  {options[(index+1)%len(options)][:14]}')
+
+
+def cal_status_display(mode, air, sample, stage):
+    # Stage tags kept short to fit 16x2 LCD
+    stage_map = {"startup":"HOT", "cooldown":"VENT", "hold":"HOLD", "rev":"REV"}
+    tag = stage_map.get(stage, "")
+    line1 = f"Cal {mode} {tag}"[:16]
+    a = "--.-" if air is None else f"{air:.1f}"
+    s = "--.-" if sample is None else f"{sample:.1f}"
+    line2 = f"A:{a} S:{s}"[:16]
+    show_two_line(line1, line2)
 def status_display(mode,t_air,stage,high):
     stage_map={'startup':'HOT','cooldown':'VENT','hold':'HOLD','rev':'REV!'}
     tag=stage_map.get(stage,''); line1=f'{mode[:10]} {tag}'.strip()[:16]; t_air=0.0 if t_air is None else t_air
@@ -265,12 +279,11 @@ def run_calibration(mode_name,low,high):
         startup_ceiling=params['startup_air_ceiling']; sample_exit_c=params['sample_exit_c']; cooldown_safe=params['cooldown_air_safe']
         stage='startup'; start_ts=time.time()
         stable_secs=0.0; last_ts=time.time()
-        show_two_line(f'Cal {mode_name}'[:16],'Confirm=Finish')
+        cal_status_display(mode_name, None, None, 'startup')
         while True:
             t1,t2,t_sample,air,tmax=_read_air_and_sample()
             tag={'startup':'HOT','cooldown':'VENT','hold':'HOLD','rev':'REV'}.get(stage,'')
-            if (air is not None) and (t_sample is not None): show_two_line(f'Cal {mode_name} {tag}'[:16], f'A:{air:.1f} S:{t_sample:.1f}')
-            else: show_two_line(f'Cal {mode_name}'[:16],'Waiting temps')
+            cal_status_display(mode_name, air, t_sample, stage)
             fans_on_state=(fan1.value>0) or (fan2.value>0); log_data(f'CAL-{mode_name}',t1,t2,t_sample,stage,motor_on,motor_dir.value,fans_on_state,reversing)
             _emergency_reverse_guard(air,high)
             if not reversing:
