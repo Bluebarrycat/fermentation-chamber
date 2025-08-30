@@ -32,11 +32,6 @@
 - Updated sourdough calibration target in `main.py`:
   - `CAL_TARGET_C['Sourdough']` changed from 25.0 °C → 27.0 °C
 
-## 2025-08-16
-- Implement **AIR sensor voting & outlier rejection**:
-  - Threshold: >2–3 °C (default **2.5 °C** via `OUTLIER_DELTA_C`)
-  - Requires **3 consecutive** suspect readings to mark a sensor bad
-  - **Rejoin** after **5 minutes** of good behavior (`OUTLIER_REJOIN_MIN`)
-  - Logs outlier events and shows brief LCD warnings (e.g., `AIR OUTLIER`)
-  - If one sensor is bad: use the other; if both are suspect: **temporary mean fallback**
-- Replaced simple AIR averaging with `compute_air_with_outlier(...)` helper.
+## 2025-08-17
+- Add 3-stage warm-up with AIR ceiling 34 °C and fans-only cool-down.
+- Calibration can now **end early** when Sample reaches target band (±0.5 °C), controlled by `CAL_EARLY_END_ENABLED` and `CAL_EARLY_END_STABLE_MIN`.

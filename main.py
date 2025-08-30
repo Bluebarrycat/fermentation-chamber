@@ -1,739 +1,336 @@
 #!/usr/bin/env python3
-import time
-import os
-import json
-import subprocess
-import csv
+# Three-stage warm-up + Early-End Calibration
+# Stage 1: Aggressive warm-up (AIR allowed up to 34°C), exit when SAMPLE >= target
+# Stage 2: Fans-only cool-down until AIR <= safe cutoff
+# Stage 3: Normal hold (AIR-only band control)
+# Emergency reverse is only for extremes. Calibration can end early when Sample reaches target band.
+
+import os, time, json, csv, subprocess
 from datetime import datetime
 from threading import Timer
-from collections import deque
 from statistics import mean
+from collections import deque
+
 from gpiozero import Button, PWMOutputDevice, DigitalOutputDevice
 from RPLCD.i2c import CharLCD
 
-# =========================
-# Configuration
-# =========================
 FAN_SPEED = 0.75
-LOOP_INTERVAL_SEC = 15          # main control cadence
-FAN_AFTER_OFF_SEC = 10          # fans run this long after motor turns off due to High
-CAL_WINDOW_MIN = 200            # minutes of data used for final calibration window
-CAL_TARGET_C = {                # target SAMPLE temperature per mode (adjust if needed)
-    'Sourdough': 27.0,
-    'Kombucha':  25.0,
-    'Water Kefir': 25.0,
+LOOP_INTERVAL_SEC = 15
+FAN_AFTER_OFF_SEC = 10
+CAL_WINDOW_MIN = 200
+CAL_EARLY_END_ENABLED = True          # End calibration early when Sample reaches target band
+CAL_EARLY_END_STABLE_MIN = 0          # Minutes Sample must stay in-band before ending (0 = immediate)
+
+CAL_TARGET_C = {'Sourdough': 27.0, 'Kombucha': 25.0, 'Water Kefir': 25.0}
+RECOMMENDED_BAND_WIDTH = 1.0
+
+STAGE_PARAMS = {
+    'Sourdough':   {'startup_air_ceiling': 34.0, 'sample_exit_c': 27.0, 'cooldown_air_safe': 28.5},
+    'Kombucha':    {'startup_air_ceiling': 34.0, 'sample_exit_c': 25.0, 'cooldown_air_safe': 27.0},
+    'Water Kefir': {'startup_air_ceiling': 34.0, 'sample_exit_c': 25.0, 'cooldown_air_safe': 26.5},
 }
-RECOMMENDED_BAND_WIDTH = 1.0    # °C total band for air setpoints during recommendation
 
-# --- Two-Phase Boost Controls ---
-# Phase 1 (Boost) → if AIR is far below band center, push hard to approach quickly.
-# Phase 2 (Hold)  → normal band logic once near center.
-BOOST_ENABLE = True
-BOOST_DELTA_C = 3.0             # Enter Boost if AIR <= (band_center - BOOST_DELTA_C)
-BOOST_EXIT_GAP_C = 1.5          # Exit Boost once AIR >= (band_center - BOOST_EXIT_GAP_C)
-BOOST_MAX_AIR_C = 31.0          # Safety: do not allow AIR to exceed this while boosting
-# --- Outlier rejection (AIR sensors) ---
-OUTLIER_DELTA_C = 2.5          # suspect if a reading jumps > 2.5 °C from its EMA (" >2–3 ")
-OUTLIER_CONSECUTIVE = 3        # consecutive suspect readings before we ignore a sensor
-OUTLIER_REJOIN_MIN = 5 * 60    # after being ignored, must behave this many seconds to rejoin
-EMA_ALPHA = 0.2                # per-sensor EMA smoothing factor (0.1–0.3 typical)
-
+EMERGENCY_INSTANT_AIR_C = 36.0
+EMERGENCY_SUSTAIN_AIR_C = 34.5
+EMERGENCY_SUSTAIN_SEC   = 60
 
 BASE_DIR_APP = "/home/rpizero/Ferment"
 LOG_DIR = os.path.join(BASE_DIR_APP, "logs")
 CAL_FILE = os.path.join(BASE_DIR_APP, "calibration_setpoints.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# =========================
-# Hardware setup
-# =========================
 lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2)
 
-button_up = Button(17)
-button_down = Button(27)
-button_left = Button(23)
-button_right = Button(22)
-button_confirm = Button(26)
+button_up=Button(17); button_down=Button(27); button_left=Button(23); button_right=Button(22); button_confirm=Button(26)
+motor_pwm = PWMOutputDevice(20); motor_dir = DigitalOutputDevice(21)
+fan1 = PWMOutputDevice(12); fan2 = PWMOutputDevice(13)
+motor_pwm.value=0.0; fan1.value=0.0; fan2.value=0.0; motor_dir.value=False
 
-motor_pwm = PWMOutputDevice(20)
-motor_dir = DigitalOutputDevice(21)
-fan1 = PWMOutputDevice(12)
-fan2 = PWMOutputDevice(13)
+os.system('modprobe w1-gpio'); os.system('modprobe w1-therm')
+BASE_DIR='/sys/bus/w1/devices/'
+SENSORS={'Sensor1':'28-7db6d445e7a7','Sensor2':'28-37e5d44570c3','Sample':'28-3ce1e3800798'}
 
-# Ensure off at start
-motor_pwm.value = 0
-fan1.value = 0
-fan2.value = 0
-motor_dir.value = False  # Mode A per wiring
+MENU=['Sourdough','Kombucha','Water Kefir','Cal Sourdough','Cal Kombucha','Cal Water Kefir','Shutdown']
+RANGES={'Sourdough':(27.8,28.8),'Kombucha':(25.5,26.5),'Water Kefir':(24.8,25.8)}
 
-# 1-Wire setup
-os.system('modprobe w1-gpio')
-os.system('modprobe w1-therm')
-BASE_DIR = '/sys/bus/w1/devices/'
-SENSORS = {
-    'Sensor1': '28-7db6d445e7a7',
-    'Sensor2': '28-37e5d44570c3',
-    'Sample':  '28-3ce1e3800798'
-}
+motor_on=False; reversing=False; fan_off_timer=None; request_pause_menu=False
+_overtemp_start_ts=None
 
-# =========================
-# Menus & ranges (defaults)
-# =========================
-MENU = [
-    'Sourdough', 'Kombucha', 'Water Kefir',
-    'Cal Sourdough', 'Cal Kombucha', 'Cal Water Kefir',
-    'Shutdown'
-]
-RANGES = {
-    'Sourdough': (24.0, 28.0),
-    'Kombucha':  (24.0, 26.0),
-    'Water Kefir': (20.0, 25.0)
-}
-
-# =========================
-# Global state
-# =========================
-motor_on = False
-reversing = False
-fan_off_timer = None
-request_pause_menu = False
-
-# Boost state (separate per loop instance)
-def _boost_should_enter(air, low, high):
-    if not BOOST_ENABLE or air is None:
-        return False
-    center = (low + high) / 2.0
-    return air <= (center - BOOST_DELTA_C)
-
-def _boost_should_exit(air, low, high):
-    if air is None:
-        return False
-    center = (low + high) / 2.0
-    # Exit when we're within a reasonable margin of the center
-    return air >= (center - BOOST_EXIT_GAP_C)
-
-# =========================
-# Persistence (calibration setpoints)
-# =========================
 def load_calibration_setpoints():
-    """Load saved setpoints from CAL_FILE and merge into RANGES (if present)."""
-    if not os.path.exists(CAL_FILE):
-        return
+    if not os.path.exists(CAL_FILE): return
     try:
-        with open(CAL_FILE, "r") as f:
-            data = json.load(f)
-        changed = False
-        for mode, vals in data.items():
-            if isinstance(vals, dict) and "low" in vals and "high" in vals:
-                low = float(vals["low"]); high = float(vals["high"])
-                if mode in RANGES and (low, high) != RANGES[mode]:
-                    RANGES[mode] = (low, high)
-                    changed = True
+        with open(CAL_FILE,'r') as f: data=json.load(f)
+        changed=False
+        for mode,vals in data.items():
+            if isinstance(vals,dict) and 'low' in vals and 'high' in vals:
+                low=float(vals['low']); high=float(vals['high'])
+                if mode in RANGES and (low,high)!=RANGES[mode]: RANGES[mode]=(low,high); changed=True
         if changed:
-            show_two_line("Loaded saved", "cal setpoints")
-            time.sleep(1.2)
+            show_two_line('Loaded saved','cal setpoints'); time.sleep(1.2)
     except Exception:
-        show_two_line("Cal file error", "Using defaults")
-        time.sleep(1.5)
+        show_two_line('Cal file error','Using defaults'); time.sleep(1.5)
 
 def save_calibration_setpoints(mode_name, low, high):
-    """Persist setpoints to CAL_FILE (per-mode)."""
-    data = {}
+    data={}
     if os.path.exists(CAL_FILE):
         try:
-            with open(CAL_FILE, "r") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    data[mode_name] = {"low": round(low, 2), "high": round(high, 2)}
-    tmp = CAL_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, CAL_FILE)
+            with open(CAL_FILE,'r') as f: data=json.load(f)
+        except Exception: data={}
+    data[mode_name]={'low':round(low,2),'high':round(high,2)}
+    tmp=CAL_FILE+'.tmp'
+    with open(tmp,'w') as f: json.dump(data,f,indent=2)
+    os.replace(tmp,CAL_FILE)
 
-# =========================
-# Logging
-# =========================
 def get_log_file():
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(LOG_DIR, f"{date_str}.csv")
-
+    return os.path.join(LOG_DIR, datetime.now().strftime('%Y-%m-%d') + '.csv')
 def _write_header_if_needed(path):
     if not os.path.exists(path):
-        with open(path, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "Timestamp", "Mode", "Temp1_C", "Temp2_C", "Sample_C",
-                "Motor", "Direction", "Fans", "Reversing"
-            ])
-
+        with open(path,'w',newline='') as file:
+            csv.writer(file).writerow(['Timestamp','Mode','Temp1_C','Temp2_C','Sample_C','Stage','Motor','Direction','Fans','Reversing'])
 def init_log():
-    """
-    Ensure today's CSV exists with header, then append a *** STARTUP *** marker row.
-    """
-    log_file = get_log_file()
-    _write_header_if_needed(log_file)
-    with open(log_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                         "*** STARTUP ***", "", "", "", "", "", "", ""])
-
-def log_data(mode, t1, t2, t_sample, motor_on_state, dir_value, fans_on_state, reversing_state):
-    log_file = get_log_file()
-    _write_header_if_needed(log_file)
-    with open(log_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            mode if mode else "",
-            f"{t1:.2f}" if t1 is not None else "ERR",
-            f"{t2:.2f}" if t2 is not None else "ERR",
-            f"{t_sample:.2f}" if t_sample is not None else "ERR",
-            "ON" if motor_on_state else "OFF",
-            "A" if not dir_value else "B",  # False = A
-            "ON" if fans_on_state else "OFF",
-            "YES" if reversing_state else "NO"
+    log=get_log_file(); _write_header_if_needed(log)
+    with open(log,'a',newline='') as f:
+        csv.writer(f).writerow([datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'*** STARTUP ***','','','','','','','',''])
+def log_data(mode,t1,t2,t_sample,stage,motor_on_state,dir_value,fans_on_state,rev_state):
+    log=get_log_file(); _write_header_if_needed(log)
+    with open(log,'a',newline='') as f:
+        csv.writer(f).writerow([
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'), mode or '',
+            f'{t1:.2f}' if t1 is not None else 'ERR', f'{t2:.2f}' if t2 is not None else 'ERR',
+            f'{t_sample:.2f}' if t_sample is not None else 'ERR', stage,
+            'ON' if motor_on_state else 'OFF', 'A' if not dir_value else 'B',
+            'ON' if fans_on_state else 'OFF', 'YES' if rev_state else 'NO'
         ])
 
-def write_calibration_report(mode, target, air_avg, sample_avg, offset, rec_low, rec_high):
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = os.path.join(LOG_DIR, f"calibration_{mode}_{ts}.txt")
-    with open(path, "w") as f:
-        f.write(f"Calibration Report - {mode}\n")
-        f.write(f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n\n")
-        f.write(f"Target SAMPLE temperature: {target:.2f} °C\n")
-        f.write(f"Window length: {CAL_WINDOW_MIN} minutes\n\n")
-        f.write(f"Average AIR (mean of Sensor1 & Sensor2): {air_avg:.2f} °C\n")
-        f.write(f"Average SAMPLE: {sample_avg:.2f} °C\n")
-        f.write(f"Computed offset (AIR - SAMPLE): {offset:.2f} °C\n\n")
-        f.write(f"Recommended AIR setpoints:\n")
-        f.write(f"  Low:  {rec_low:.2f} °C\n")
-        f.write(f"  High: {rec_high:.2f} °C\n")
-        f.write("\nPersisted to: calibration_setpoints.json\n")
+def write_calibration_report(mode,target,air_avg,sample_avg,offset,rec_low,rec_high):
+    ts=datetime.now().strftime('%Y-%m-%d_%H-%M-%S'); path=os.path.join(LOG_DIR,f'calibration_{mode}_{ts}.txt')
+    with open(path,'w') as f:
+        f.write(f'Calibration Report - {mode}\n')
+        f.write(f'Timestamp: {datetime.now().isoformat(timespec="seconds")}\n\n')
+        f.write(f'Target SAMPLE temperature: {target:.2f} °C\n')
+        f.write(f'Window length: {CAL_WINDOW_MIN} minutes\n\n')
+        f.write(f'Average AIR (mean of Sensor1 & Sensor2): {air_avg:.2f} °C\n')
+        f.write(f'Average SAMPLE: {sample_avg:.2f} °C\n')
+        f.write(f'Computed offset (AIR - SAMPLE): {offset:.2f} °C\n\n')
+        f.write('Recommended AIR setpoints:\n')
+        f.write(f'  Low:  {rec_low:.2f} °C\n')
+        f.write(f'  High: {rec_high:.2f} °C\n')
+        f.write('\nPersisted to: calibration_setpoints.json\n')
     return path
 
-# =========================
-# Helpers
-# =========================
 def read_temp(sensor_id):
-    path = os.path.join(BASE_DIR, sensor_id, 'w1_slave')
+    path=os.path.join(BASE_DIR, sensor_id, 'w1_slave')
     try:
-        with open(path) as f:
-            lines = f.readlines()
-        if not lines or lines[0].strip()[-3:] != 'YES':
-            return None
-        t_pos = lines[1].find('t=')
-        if t_pos == -1:
-            return None
-        c = float(lines[1][t_pos + 2:]) / 1000.0
-        return round(c, 2)
-    except:
-        return None
+        with open(path) as f: lines=f.readlines()
+        if not lines or lines[0].strip().endswith('NO'): return None
+        t_pos=lines[1].find('t=')
+        if t_pos==-1: return None
+        return round(float(lines[1][t_pos+2:])/1000.0,2)
+    except: return None
 
-
-# --- Sensor voting & outlier rejection helpers ---
-_air_ema = {}            # sensor_id -> float (EMA °C)
-_air_bad = {}            # sensor_id -> bool
-_air_bad_since = {}      # sensor_id -> epoch seconds when it was marked bad
-_air_suspect_count = {}  # sensor_id -> int
-
-def _ema_update(sensor_id: str, value_c: float) -> float:
-    prev = _air_ema.get(sensor_id, value_c)
-    ema = (1.0 - EMA_ALPHA) * prev + EMA_ALPHA * value_c
-    _air_ema[sensor_id] = ema
-    return ema
-
-def _log_outlier_event(msg: str):
-    try:
-        print(f"[OUTLIER] {msg}")
-        # If you have structured event logging, call it here, e.g.:
-        # write_event("AIR_OUTLIER", msg)
-    except Exception:
-        pass
-
-def _lcd_flash_warning(line1: str, line2: str = "", seconds: float = 2.0):
-    try:
-        lcd.clear()
-        lcd.write_string(line1[:16])
-        if line2:
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(line2[:16])
-        time.sleep(seconds)
-        # If you have a render_status() or similar, call it here to restore normal screen.
-        # render_status()
-    except Exception:
-        pass
-
-def _mark_bad(sensor_id: str):
-    if not _air_bad.get(sensor_id, False):
-        _air_bad[sensor_id] = True
-        _air_bad_since[sensor_id] = time.time()
-        _log_outlier_event(f"SENSOR_MARK_BAD {sensor_id}")
-        _lcd_flash_warning("AIR OUTLIER", sensor_id[-4:].upper())
-
-def _maybe_rejoin(sensor_id: str, ok_now: bool):
-    """Let a sensor rejoin after cooldown if readings look sane again."""
-    if _air_bad.get(sensor_id, False):
-        if time.time() - _air_bad_since.get(sensor_id, 0) >= OUTLIER_REJOIN_MIN and ok_now:
-            _air_bad[sensor_id] = False
-            _air_suspect_count[sensor_id] = 0
-            _log_outlier_event(f"SENSOR_REJOIN {sensor_id}")
-            _lcd_flash_warning("AIR SENSOR OK", sensor_id[-4:].upper())
-
-def compute_air_with_outlier(a1_c, a2_c, sensor1_id, sensor2_id):
-    """
-    Returns (air_c, used_sensors_list)
-    - EMA detects abrupt per-sensor jumps.
-    - If one sensor is persistently suspect, we ignore it for OUTLIER_REJOIN_MIN.
-    - If both are good, average. If one is bad, use the other. If both bad, mean fallback.
-    """
-    # Update EMA and deviations
-    ema1 = _ema_update(sensor1_id, a1_c) if a1_c is not None else _air_ema.get(sensor1_id, None)
-    ema2 = _ema_update(sensor2_id, a2_c) if a2_c is not None else _air_ema.get(sensor2_id, None)
-    dev1 = abs(a1_c - ema1) if (a1_c is not None and ema1 is not None) else 0.0
-    dev2 = abs(a2_c - ema2) if (a2_c is not None and ema2 is not None) else 0.0
-
-    sus1_now = (a1_c is not None and ema1 is not None and dev1 > OUTLIER_DELTA_C)
-    sus2_now = (a2_c is not None and ema2 is not None and dev2 > OUTLIER_DELTA_C)
-
-    # Only count suspect sequences when sensor has a real reading
-    if a1_c is not None and not _air_bad.get(sensor1_id, False):
-        _air_suspect_count[sensor1_id] = (_air_suspect_count.get(sensor1_id, 0) + 1) if sus1_now else 0
-        if _air_suspect_count[sensor1_id] >= OUTLIER_CONSECUTIVE:
-            _mark_bad(sensor1_id)
-    if a2_c is not None and not _air_bad.get(sensor2_id, False):
-        _air_suspect_count[sensor2_id] = (_air_suspect_count.get(sensor2_id, 0) + 1) if sus2_now else 0
-        if _air_suspect_count[sensor2_id] >= OUTLIER_CONSECUTIVE:
-            _mark_bad(sensor2_id)
-
-    # Allow rejoin after cooldown if current reading looks okay (or no reading, don't rejoin)
-    if a1_c is not None:
-        _maybe_rejoin(sensor1_id, ok_now=not sus1_now)
-    if a2_c is not None:
-        _maybe_rejoin(sensor2_id, ok_now=not sus2_now)
-
-    s1_bad = _air_bad.get(sensor1_id, False)
-    s2_bad = _air_bad.get(sensor2_id, False)
-
-    # Choose value
-    if (a1_c is None) and (a2_c is None):
-        return None, []
-
-    if s1_bad and not s2_bad and a2_c is not None:
-        return (a2_c, [sensor2_id])
-    elif s2_bad and not s1_bad and a1_c is not None:
-        return (a1_c, [sensor1_id])
-    elif not s1_bad and not s2_bad:
-        # Both good (or not flagged): average of available readings
-        vals = [v for v in (a1_c, a2_c) if v is not None]
-        return (sum(vals) / len(vals), [sensor1_id if a1_c is not None else None, sensor2_id if a2_c is not None else None])
-    else:
-        # Both bad or ambiguous: fallback to mean of available readings
-        vals = [v for v in (a1_c, a2_c) if v is not None]
-        if not vals:
-            return None, []
-        _log_outlier_event("BOTH_SENSORS_SUSPECT — using mean temporarily")
-        return (sum(vals) / len(vals), [])
-
-def fans_on():
-    fan1.value = FAN_SPEED
-    fan2.value = FAN_SPEED
-
-def fans_off():
-    fan1.value = 0
-    fan2.value = 0
-
+def fans_on(): fan1.value=FAN_SPEED; fan2.value=FAN_SPEED
+def fans_off(): fan1.value=0.0; fan2.value=0.0
 def cancel_fan_timer():
     global fan_off_timer
-    if fan_off_timer:
-        fan_off_timer.cancel()
-        fan_off_timer = None
-
+    if fan_off_timer: fan_off_timer.cancel(); fan_off_timer=None
 def schedule_fan_off(delay=FAN_AFTER_OFF_SEC):
     global fan_off_timer
-    cancel_fan_timer()
-    fan_off_timer = Timer(delay, fans_off)
-    fan_off_timer.start()
+    cancel_fan_timer(); fan_off_timer=Timer(delay,fans_off); fan_off_timer.start()
 
-# LCD helpers (always clear before writing, no '\n')
-def show_two_line(a, b):
-    lcd.clear()
-    lcd.write_string(a[:16])
-    lcd.cursor_pos = (1, 0)
-    lcd.write_string(b[:16])
+def show_two_line(a,b):
+    lcd.clear(); lcd.write_string(a[:16]); lcd.cursor_pos=(1,0); lcd.write_string(b[:16])
+def show_menu(options,index):
+    show_two_line(f'> {options[index][:14]}', f'  {options[(index+1)%len(options)][:14]}')
+def status_display(mode,t_air,stage,high):
+    stage_map={'startup':'HOT','cooldown':'VENT','hold':'HOLD','rev':'REV!'}
+    tag=stage_map.get(stage,''); line1=f'{mode[:10]} {tag}'.strip()[:16]; t_air=0.0 if t_air is None else t_air
+    show_two_line(line1, f'{t_air:.1f}C/{high:.0f}C')
 
-def show_menu(options, index):
-    current = f"> {options[index][:14]}"
-    nxt = options[(index + 1) % len(options)]
-    next_line = f"  {nxt[:14]}"
-    show_two_line(current, next_line)
-
-def status_display(mode, tval, high, prefix=""):
-    # line2 shows current and high; prefix shows "Boost" when active
-    tag = "Boost " if prefix == "boost" else ""
-    line1 = (tag + mode)[:16]
-    line2 = f"{tval:.1f}C/{high:.0f}C"
-    show_two_line(line1, line2)
-
-# Input polling
 def wait_for_button_any():
     while True:
-        if button_up.is_pressed:
-            time.sleep(0.2); return "UP"
-        if button_down.is_pressed:
-            time.sleep(0.2); return "DOWN"
-        if button_left.is_pressed:
-            time.sleep(0.2); return "LEFT"
-        if button_right.is_pressed:
-            time.sleep(0.2); return "RIGHT"
-        if button_confirm.is_pressed:
-            time.sleep(0.2); return "CONFIRM"
+        if button_up.is_pressed: time.sleep(0.2); return 'UP'
+        if button_down.is_pressed: time.sleep(0.2); return 'DOWN'
+        if button_left.is_pressed: time.sleep(0.2); return 'LEFT'
+        if button_right.is_pressed: time.sleep(0.2); return 'RIGHT'
+        if button_confirm.is_pressed: time.sleep(0.2); return 'CONFIRM'
         time.sleep(0.05)
 
-def select_from_menu(options, initial_index=0, cancel_with_left=False):
-    idx = initial_index
-    show_menu(options, idx)
+def select_from_menu(options,initial_index=0,cancel_with_left=False):
+    idx=initial_index; show_menu(options,idx)
     while True:
-        btn = wait_for_button_any()
-        if btn == "UP":
-            idx = (idx - 1) % len(options); show_menu(options, idx)
-        elif btn == "DOWN":
-            idx = (idx + 1) % len(options); show_menu(options, idx)
-        elif btn == "CONFIRM":
-            return idx
-        elif cancel_with_left and btn == "LEFT":
-            return None
+        btn=wait_for_button_any()
+        if btn=='UP': idx=(idx-1)%len(options); show_menu(options,idx)
+        elif btn=='DOWN': idx=(idx+1)%len(options); show_menu(options,idx)
+        elif btn=='CONFIRM': return idx
+        elif cancel_with_left and btn=='LEFT': return None
 
 def on_left_pressed():
-    global request_pause_menu
-    request_pause_menu = True
+    global request_pause_menu; request_pause_menu=True
+button_left.when_pressed=on_left_pressed
 
-button_left.when_pressed = on_left_pressed
-
-# =========================
-# Control & Menus
-# =========================
 def safe_stop():
     global motor_on
-    motor_pwm.value = 0.0
-    motor_on = False
-    cancel_fan_timer()
-    fans_off()
-
+    motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_off()
 def shutdown_now():
-    # write shutdown marker then poweroff
-    log_file = get_log_file()
-    _write_header_if_needed(log_file)
-    with open(log_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                         "*** SHUTDOWN ***", "", "", "", "", "", "", ""])
-    safe_stop()
-    show_two_line("Shutting down", "")
-    time.sleep(1)
-    subprocess.call(['sudo', 'shutdown', 'now'])
-
+    log=get_log_file(); _write_header_if_needed(log)
+    with open(log,'a',newline='') as f: csv.writer(f).writerow([datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'*** SHUTDOWN ***','','','','','','','',''])
+    safe_stop(); show_two_line('Shutting down',''); time.sleep(1); subprocess.call(['sudo','shutdown','now'])
 def pause_menu():
-    options = ['Resume', 'Change Mode', 'Shutdown']
-    sel = select_from_menu(options, initial_index=0, cancel_with_left=True)
-    if sel is None or sel == 0:
-        return "resume"
-    elif sel == 1:
-        return "change"
-    else:
-        return "shutdown"
+    sel=select_from_menu(['Resume','Change Mode','Shutdown'],0,True)
+    return 'resume' if sel in (None,0) else ('change' if sel==1 else 'shutdown')
 
 def _read_air_and_sample():
-    t1 = read_temp(SENSORS['Sensor1'])
-    t2 = read_temp(SENSORS['Sensor2'])
-    t_sample = read_temp(SENSORS['Sample'])  # read + log only (never used for control)
-    air, used = compute_air_with_outlier(t1, t2, SENSORS['Sensor1'], SENSORS['Sensor2'])
-    return t1, t2, t_sample, air
+    t1=read_temp(SENSORS['Sensor1']); t2=read_temp(SENSORS['Sensor2']); t_sample=read_temp(SENSORS['Sample'])
+    air_vals=[t for t in (t1,t2) if t is not None]; air=None if not air_vals else mean(air_vals); tmax=None if not air_vals else max(air_vals)
+    return t1,t2,t_sample,air,tmax
 
-def _apply_emergency_reverse(tmax, high):
-    global reversing, motor_on
-    if not reversing and tmax is not None and tmax >= high + 5:
-        reversing = True
-        motor_dir.value = not motor_dir.value
-        motor_pwm.value = 1.0
-        cancel_fan_timer(); fans_on()
+def _emergency_reverse_guard(air,high):
+    global reversing, motor_on, _overtemp_start_ts
+    if air is None: return
+    now=time.time()
+    if air>=EMERGENCY_INSTANT_AIR_C and not reversing:
+        reversing=True; motor_dir.value=not motor_dir.value; motor_pwm.value=1.0; cancel_fan_timer(); fans_on(); _overtemp_start_ts=None; return
+    if air>=EMERGENCY_SUSTAIN_AIR_C:
+        if _overtemp_start_ts is None: _overtemp_start_ts=now
+        elif (now-_overtemp_start_ts)>=EMERGENCY_SUSTAIN_SEC and not reversing:
+            reversing=True; motor_dir.value=not motor_dir.value; motor_pwm.value=1.0; cancel_fan_timer(); fans_on(); _overtemp_start_ts=None
+    else:
+        _overtemp_start_ts=None
+    if reversing and air<=(high-1.0):
+        reversing=False; motor_pwm.value=0.0; schedule_fan_off(); motor_on=False; motor_dir.value=False
 
-    if reversing and tmax is not None and tmax <= high - 1:
-        reversing = False
-        motor_pwm.value = 0.0
-        schedule_fan_off()
-        motor_on = False
-        motor_dir.value = False  # back to Mode A
-
-def run_mode(mode_name, low, high):
-    """
-    Normal production control loop for a selected mode.
-    NOTE: Sample is always read & logged, but NOT used for any control.
-    Two-phase behavior:
-      - Boost: if AIR << center, push hard until near center (capped by BOOST_MAX_AIR_C).
-      - Hold:  original band logic.
-    """
-    global motor_on, reversing, request_pause_menu
-
-    motor_dir.value = False  # Mode A
-    motor_on = False
-    reversing = False
-    cancel_fan_timer(); fans_off()
-    status_display(mode_name, 0.0, high)
-
-    boosting = False
-    center = (low + high) / 2.0
-
+def run_mode(mode_name,low,high):
+    global motor_on,reversing,request_pause_menu
+    motor_dir.value=False; motor_on=False; reversing=False; cancel_fan_timer(); fans_off()
+    stage='startup'; params=STAGE_PARAMS.get(mode_name,STAGE_PARAMS['Sourdough'])
+    startup_ceiling=params['startup_air_ceiling']; sample_exit_c=params['sample_exit_c']; cooldown_safe=params['cooldown_air_safe']
     while True:
-        t1, t2, t_sample, air = _read_air_and_sample()
-        tmax = None
-        if t1 is not None or t2 is not None:
-            tmax = max([v for v in (t1, t2) if v is not None])
-
-        # Display & log
-        status_display(mode_name, (tmax if tmax is not None else 0.0), high, prefix=("boost" if boosting else ""))
-        log_data(mode_name, t1, t2, t_sample, motor_on, motor_dir.value, fan1.value > 0 or fan2.value > 0, reversing)
-
-        # Emergency Reverse guard (AIR only)
-        if tmax is not None:
-            _apply_emergency_reverse(tmax, high)
-
-        if reversing:
-            # let reverse branch above handle transitions; skip normal/boost control
-            pass
-        else:
-            # --- Decide Boost vs Hold ---
-            if BOOST_ENABLE:
-                if not boosting and air is not None and _boost_should_enter(air, low, high):
-                    boosting = True
-                elif boosting and air is not None and _boost_should_exit(air, low, high):
-                    boosting = False
-
-            if boosting:
-                # BOOST PHASE: push hard but don't exceed BOOST_MAX_AIR_C
-                if air is not None and air >= min(BOOST_MAX_AIR_C, center + 1.0):
-                    # close enough to center or hitting safety cap → stop pushing
-                    motor_pwm.value = 0.0
-                    motor_on = False
-                    cancel_fan_timer(); fans_on()
-                    schedule_fan_off()
+        t1,t2,t_sample,air,tmax=_read_air_and_sample(); status_display(mode_name,air,stage,high)
+        fans_on_state=(fan1.value>0) or (fan2.value>0); log_data(mode_name,t1,t2,t_sample,stage,motor_on,motor_dir.value,fans_on_state,reversing)
+        _emergency_reverse_guard(air,high)
+        if not reversing:
+            if stage=='startup':
+                if (t_sample is not None) and (t_sample>=sample_exit_c):
+                    motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); stage='cooldown'
                 else:
-                    motor_dir.value = False
-                    motor_pwm.value = 1.0
-                    motor_on = True
-                    cancel_fan_timer(); fans_on()
+                    if (air is not None) and (air>=startup_ceiling):
+                        motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
+                    else:
+                        motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
+            elif stage=='cooldown':
+                motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
+                if (air is not None) and (air<=cooldown_safe): schedule_fan_off(); stage='hold'
             else:
-                # HOLD PHASE: original band logic (AIR only)
                 if tmax is not None:
-                    if motor_on and tmax > high:
-                        motor_pwm.value = 0.0
-                        motor_on = False
-                        cancel_fan_timer(); fans_on()
-                        schedule_fan_off()
-                    if not motor_on and tmax <= low:
-                        motor_dir.value = False
-                        motor_pwm.value = 1.0
-                        motor_on = True
-                        cancel_fan_timer(); fans_on()
-
-        # 15-second interval with responsive pause
-        for _ in range(int(LOOP_INTERVAL_SEC / 0.1)):
+                    if motor_on and tmax>high:
+                        motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); schedule_fan_off()
+                    if (not motor_on) and tmax<=low:
+                        motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
+        for _ in range(int(LOOP_INTERVAL_SEC/0.1)):
             if request_pause_menu:
-                choice = pause_menu()
-                if choice == "resume":
-                    request_pause_menu = False; break
-                elif choice == "change":
-                    request_pause_menu = False; safe_stop(); return "change"
-                elif choice == "shutdown":
-                    shutdown_now(); return "shutdown"
+                choice=pause_menu()
+                if choice=='resume': request_pause_menu=False; break
+                elif choice=='change': request_pause_menu=False; safe_stop(); return 'change'
+                elif choice=='shutdown': shutdown_now(); return 'shutdown'
             time.sleep(0.1)
 
-def run_calibration(mode_name, low, high):
-    """
-    Calibration mode:
-    - Runs chamber with current air setpoints (low/high).
-    - Ends when Confirm is pressed OR when CAL_WINDOW_MIN elapses.
-    - Uses last CAL_WINDOW_MIN of data (or all available if shorter).
-    - Sample is USED here to compute offset; still ignored for control itself.
-    - On finish: computes recommendation, SAVES to disk, APPLIES in memory, returns to menu.
-
-    Two-phase behavior mirrors run_mode: Boost based on AIR vs band center,
-    then Hold with original band logic. Emergency reverse remains in place.
-    """
-    global motor_on, reversing, request_pause_menu
-
-    # --- edge-triggered Confirm handler for reliable finish ---
-    finish_requested = False
+def run_calibration(mode_name,low,high):
+    global motor_on,reversing,request_pause_menu
+    finish_requested=False
     def _on_confirm():
-        nonlocal finish_requested
-        finish_requested = True
-
-    old_confirm_handler = button_confirm.when_pressed
-    button_confirm.when_pressed = _on_confirm
-
+        nonlocal finish_requested; finish_requested=True
+    old=button_confirm.when_pressed; button_confirm.when_pressed=_on_confirm
     try:
-        target = CAL_TARGET_C.get(mode_name, 25.0)
-        motor_dir.value = False
-        motor_on = False; reversing = False
-        cancel_fan_timer(); fans_off()
-
-        maxlen = max(1, int((CAL_WINDOW_MIN * 60) / LOOP_INTERVAL_SEC))
-        air_buf = deque(maxlen=maxlen)     # mean of Sensor1 & Sensor2
-        sample_buf = deque(maxlen=maxlen)
-
-        start_ts = time.time()
-        boosting = False
-        center = (low + high) / 2.0
-
-        # UI
-        show_two_line(f"Cal {mode_name}"[:16], "Confirm=Finish")
-
+        target=CAL_TARGET_C.get(mode_name,25.0); motor_dir.value=False; motor_on=False; reversing=False; cancel_fan_timer(); fans_off()
+        maxlen=max(1,int((CAL_WINDOW_MIN*60)/LOOP_INTERVAL_SEC)); air_buf=deque(maxlen=maxlen); sample_buf=deque(maxlen=maxlen)
+        params=STAGE_PARAMS.get(mode_name,STAGE_PARAMS['Sourdough'])
+        startup_ceiling=params['startup_air_ceiling']; sample_exit_c=params['sample_exit_c']; cooldown_safe=params['cooldown_air_safe']
+        stage='startup'; start_ts=time.time()
+        # Early-end trackers
+        stable_secs=0.0; last_ts=time.time()
+        show_two_line(f'Cal {mode_name}'[:16],'Confirm=Finish')
         while True:
-            t1, t2, t_sample, air = _read_air_and_sample()
-            air_vals = [t for t in (t1, t2) if t is not None]
-            tmax = None if not air_vals else max(air_vals)
-
-            # Short status
-            if air is not None and t_sample is not None:
-                # show when boosting for operator awareness
-                tag = "B" if boosting else ""
-                show_two_line(f"Cal {mode_name}{tag}"[:16], f"A:{air:.1f} S:{t_sample:.1f}")
-            else:
-                show_two_line(f"Cal {mode_name}"[:16], "Waiting temps")
-
-            # Log as normal
-            log_data(f"CAL-{mode_name}", t1, t2, t_sample, motor_on, motor_dir.value, fan1.value > 0 or fan2.value > 0, reversing)
-
-            # Emergency Reverse (AIR only)
-            if tmax is not None:
-                _apply_emergency_reverse(tmax, high)
-
+            t1,t2,t_sample,air,tmax=_read_air_and_sample()
+            tag={'startup':'HOT','cooldown':'VENT','hold':'HOLD','rev':'REV'}.get(stage,'')
+            if (air is not None) and (t_sample is not None): show_two_line(f'Cal {mode_name} {tag}'[:16], f'A:{air:.1f} S:{t_sample:.1f}')
+            else: show_two_line(f'Cal {mode_name}'[:16],'Waiting temps')
+            fans_on_state=(fan1.value>0) or (fan2.value>0); log_data(f'CAL-{mode_name}',t1,t2,t_sample,stage,motor_on,motor_dir.value,fans_on_state,reversing)
+            _emergency_reverse_guard(air,high)
             if not reversing:
-                # --- Decide Boost vs Hold (AIR only) ---
-                if BOOST_ENABLE and air is not None:
-                    if not boosting and _boost_should_enter(air, low, high):
-                        boosting = True
-                    elif boosting and _boost_should_exit(air, low, high):
-                        boosting = False
-
-                if boosting:
-                    # BOOST PHASE with safety cap
-                    if air is not None and air >= min(BOOST_MAX_AIR_C, center + 1.0):
-                        motor_pwm.value = 0.0
-                        motor_on = False
-                        cancel_fan_timer(); fans_on()
-                        schedule_fan_off()
+                if stage=='startup':
+                    if (t_sample is not None) and (t_sample>=sample_exit_c):
+                        motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); stage='cooldown'
                     else:
-                        motor_dir.value = False
-                        motor_pwm.value = 1.0
-                        motor_on = True
-                        cancel_fan_timer(); fans_on()
+                        if (air is not None) and (air>=startup_ceiling):
+                            motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
+                        else:
+                            motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
+                elif stage=='cooldown':
+                    motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
+                    if (air is not None) and (air<=cooldown_safe): schedule_fan_off(); stage='hold'
                 else:
-                    # HOLD PHASE: original band logic
-                    if air is not None:
-                        if motor_on and air > high:
-                            motor_pwm.value = 0.0
-                            motor_on = False
-                            cancel_fan_timer(); fans_on()
-                            schedule_fan_off()
-                        if not motor_on and air <= low:
-                            motor_dir.value = False
-                            motor_pwm.value = 1.0
-                            motor_on = True
-                            cancel_fan_timer(); fans_on()
-
-            # Add to buffers (only if we have readings)
+                    if tmax is not None:
+                        if motor_on and tmax>high:
+                            motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); schedule_fan_off()
+                        if (not motor_on) and tmax<=low:
+                            motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
+            # Buffers
             if air is not None: air_buf.append(air)
             if t_sample is not None: sample_buf.append(t_sample)
-
-            # --- Finish conditions ---
-            elapsed = time.time() - start_ts
-            if finish_requested or elapsed >= CAL_WINDOW_MIN * 60:
+            # Early end: Sample in target band for configured stability
+            target_low = target - 0.5; target_high = target + 0.5
+            now_ts=time.time(); dt=now_ts-last_ts; last_ts=now_ts
+            in_band = (t_sample is not None) and (t_sample>=target_low) and (t_sample<=target_high)
+            stable_secs = stable_secs + dt if in_band else 0.0
+            # Finish conditions
+            elapsed=time.time()-start_ts
+            required_stable = max(0, CAL_EARLY_END_STABLE_MIN) * 60
+            if finish_requested or elapsed >= CAL_WINDOW_MIN*60 or (CAL_EARLY_END_ENABLED and stable_secs >= required_stable and in_band):
                 break
-
-            # Allow Pause menu with Left; also check finish flag frequently
-            for _ in range(int(LOOP_INTERVAL_SEC / 0.1)):
-                if finish_requested:
-                    break
+            # Pause & pacing
+            for _ in range(int(LOOP_INTERVAL_SEC/0.1)):
+                if finish_requested: break
                 if request_pause_menu:
-                    choice = pause_menu()
-                    if choice == "resume":
-                        request_pause_menu = False; break
-                    elif choice == "change":
-                        request_pause_menu = False; safe_stop(); return "change"
-                    elif choice == "shutdown":
-                        shutdown_now(); return "shutdown"
+                    choice=pause_menu()
+                    if choice=='resume': request_pause_menu=False; break
+                    elif choice=='change': request_pause_menu=False; safe_stop(); return 'change'
+                    elif choice=='shutdown': shutdown_now(); return 'shutdown'
                 time.sleep(0.1)
-            if finish_requested:
-                break
-
-        # Compute recommendation (Sample USED here)
-        if len(air_buf) == 0 or len(sample_buf) == 0:
-            show_two_line("Cal failed", "No data")
-            time.sleep(2)
-            return "change"
-
-        air_avg = mean(air_buf)
-        sample_avg = mean(sample_buf)
-        offset = air_avg - sample_avg           # positive if air hotter than sample
-        center_calc = target + offset           # desired air avg to hold target sample
-        half = RECOMMENDED_BAND_WIDTH / 2.0
-        rec_low, rec_high = center_calc - half, center_calc + half
-
-        # Save & apply
-        save_calibration_setpoints(mode_name, rec_low, rec_high)
-        RANGES[mode_name] = (rec_low, rec_high)
-
-        # Save report & show on LCD
-        write_calibration_report(mode_name, target, air_avg, sample_avg, offset, rec_low, rec_high)
-        show_two_line("Cal saved+applied", f"L:{rec_low:.1f} H:{rec_high:.1f}")
-        time.sleep(4)
-        return "change"
-
+            if finish_requested: break
+        if len(air_buf)==0 or len(sample_buf)==0:
+            show_two_line('Cal failed','No data'); time.sleep(2); return 'change'
+        air_avg=mean(air_buf); sample_avg=mean(sample_buf); offset=air_avg-sample_avg
+        center=target+offset; half=RECOMMENDED_BAND_WIDTH/2.0; rec_low,rec_high=center-half,center+half
+        save_calibration_setpoints(mode_name,rec_low,rec_high); RANGES[mode_name]=(rec_low,rec_high)
+        write_calibration_report(mode_name,target,air_avg,sample_avg,offset,rec_low,rec_high)
+        show_two_line('Cal saved+applied', f'L:{rec_low:.1f} H:{rec_high:.1f}'); time.sleep(4); return 'change'
     finally:
-        # restore previous handler to avoid side-effects outside calibration
-        button_confirm.when_pressed = old_confirm_handler
+        button_confirm.when_pressed=old
 
 def main_menu():
-    idx = 0
-    show_menu(MENU, idx)
+    idx=0; show_menu(MENU,idx)
     while True:
-        btn = wait_for_button_any()
-        if btn == "UP":
-            idx = (idx - 1) % len(MENU); show_menu(MENU, idx)
-        elif btn == "DOWN":
-            idx = (idx + 1) % len(MENU); show_menu(MENU, idx)
-        elif btn == "CONFIRM":
-            choice = MENU[idx]
-            if choice == 'Shutdown':
-                shutdown_now(); return ('shutdown',)
+        btn=wait_for_button_any()
+        if btn=='UP': idx=(idx-1)%len(MENU); show_menu(MENU,idx)
+        elif btn=='DOWN': idx=(idx+1)%len(MENU); show_menu(MENU,idx)
+        elif btn=='CONFIRM':
+            choice=MENU[idx]
+            if choice=='Shutdown': shutdown_now(); return ('shutdown',)
             elif choice.startswith('Cal '):
-                base = choice.replace('Cal ', '')
-                # Always use current (possibly loaded) setpoints:
-                low, high = RANGES[base]
-                return ('cal', base, low, high)
+                base=choice.replace('Cal ',''); low,high=RANGES[base]; return ('cal',base,low,high)
             else:
-                low, high = RANGES[choice]
-                return ('mode', choice, low, high)
+                low,high=RANGES[choice]; return ('mode',choice,low,high)
 
 def main():
-    load_calibration_setpoints()  # merge any saved setpoints before anything else
-    init_log()
+    load_calibration_setpoints(); init_log()
     while True:
-        sel = main_menu()
-        if sel[0] == 'shutdown':
-            return
-        if sel[0] == 'mode':
-            _, mode_name, low, high = sel
-            result = run_mode(mode_name, low, high)
-            if result == "shutdown":
-                return
-        elif sel[0] == 'cal':
-            _, mode_name, low, high = sel
-            result = run_calibration(mode_name, low, high)
-            if result == "shutdown":
-                return
-        # if "change", loop back to main menu
+        sel=main_menu()
+        if sel[0]=='shutdown': return
+        if sel[0]=='mode':
+            _,mode_name,low,high=sel; result=run_mode(mode_name,low,high)
+            if result=='shutdown': return
+        elif sel[0]=='cal':
+            _,mode_name,low,high=sel; result=run_calibration(mode_name,low,high)
+            if result=='shutdown': return
 
-if __name__ == '__main__':
-    main()
+if __name__=='__main__': main()
