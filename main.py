@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-# Three-stage warm-up + Early-End Calibration (>= target) + Set-and-Forget
+# Three-stage warm-up + Early-End Calibration
 # Stage 1: Aggressive warm-up (AIR allowed up to 34°C), exit when SAMPLE >= target
 # Stage 2: Fans-only cool-down until AIR <= safe cutoff
 # Stage 3: Normal hold (AIR-only band control)
-# Emergency reverse is only for extremes.
-# Calibration deletes previous reports at start and autostarts normal mode at completion.
+# Emergency reverse is only for extremes. Calibration can end early when Sample reaches target band.
 
 import os, time, json, csv, subprocess
 from datetime import datetime
 from threading import Timer
 from statistics import mean
 from collections import deque
-from pathlib import Path
 
 from gpiozero import Button, PWMOutputDevice, DigitalOutputDevice
 from RPLCD.i2c import CharLCD
@@ -20,8 +18,8 @@ FAN_SPEED = 0.75
 LOOP_INTERVAL_SEC = 15
 FAN_AFTER_OFF_SEC = 10
 CAL_WINDOW_MIN = 200
-CAL_EARLY_END_ENABLED = True          # End calibration early when Sample >= target temperature
-CAL_EARLY_END_STABLE_MIN = 0          # Minutes Sample must stay >= target before ending (0 = immediate)
+CAL_EARLY_END_ENABLED = True          # End calibration early when Sample reaches target band
+CAL_EARLY_END_STABLE_MIN = 0          # Minutes Sample must stay in-band before ending (0 = immediate)
 
 CAL_TARGET_C = {'Sourdough': 27.0, 'Kombucha': 25.0, 'Water Kefir': 25.0}
 RECOMMENDED_BAND_WIDTH = 1.0
@@ -120,24 +118,6 @@ def write_calibration_report(mode,target,air_avg,sample_avg,offset,rec_low,rec_h
         f.write('\nPersisted to: calibration_setpoints.json\n')
     return path
 
-
-
-def delete_old_cal_reports_for_mode(mode_name: str):
-    """Remove existing calibration reports for *this* product only, case-insensitive.
-    Matches both 'calibration_Sourdough*.txt' and 'calibration_sourdough*.txt' styles.
-    """
-    try:
-        key = mode_name.strip().lower().replace(' ', '_')
-        for p in Path(LOG_DIR).glob('calibration_*.txt'):
-            name_l = p.name.lower()
-            if name_l.startswith(f'calibration_{key}'):
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
 def read_temp(sensor_id):
     path=os.path.join(BASE_DIR, sensor_id, 'w1_slave')
     try:
@@ -161,17 +141,6 @@ def show_two_line(a,b):
     lcd.clear(); lcd.write_string(a[:16]); lcd.cursor_pos=(1,0); lcd.write_string(b[:16])
 def show_menu(options,index):
     show_two_line(f'> {options[index][:14]}', f'  {options[(index+1)%len(options)][:14]}')
-
-
-def cal_status_display(mode, air, sample, stage):
-    # Stage tags kept short to fit 16x2 LCD
-    stage_map = {"startup":"HOT", "cooldown":"VENT", "hold":"HOLD", "rev":"REV"}
-    tag = stage_map.get(stage, "")
-    line1 = f"Cal {mode} {tag}"[:16]
-    a = "--.-" if air is None else f"{air:.1f}"
-    s = "--.-" if sample is None else f"{sample:.1f}"
-    line2 = f"A:{a} S:{s}"[:16]
-    show_two_line(line1, line2)
 def status_display(mode,t_air,stage,high):
     stage_map={'startup':'HOT','cooldown':'VENT','hold':'HOLD','rev':'REV!'}
     tag=stage_map.get(stage,''); line1=f'{mode[:10]} {tag}'.strip()[:16]; t_air=0.0 if t_air is None else t_air
@@ -273,17 +242,18 @@ def run_calibration(mode_name,low,high):
     old=button_confirm.when_pressed; button_confirm.when_pressed=_on_confirm
     try:
         target=CAL_TARGET_C.get(mode_name,25.0); motor_dir.value=False; motor_on=False; reversing=False; cancel_fan_timer(); fans_off()
-        delete_old_cal_reports_for_mode(mode_name)
         maxlen=max(1,int((CAL_WINDOW_MIN*60)/LOOP_INTERVAL_SEC)); air_buf=deque(maxlen=maxlen); sample_buf=deque(maxlen=maxlen)
         params=STAGE_PARAMS.get(mode_name,STAGE_PARAMS['Sourdough'])
         startup_ceiling=params['startup_air_ceiling']; sample_exit_c=params['sample_exit_c']; cooldown_safe=params['cooldown_air_safe']
         stage='startup'; start_ts=time.time()
+        # Early-end trackers
         stable_secs=0.0; last_ts=time.time()
-        cal_status_display(mode_name, None, None, 'startup')
+        show_two_line(f'Cal {mode_name}'[:16],'Confirm=Finish')
         while True:
             t1,t2,t_sample,air,tmax=_read_air_and_sample()
             tag={'startup':'HOT','cooldown':'VENT','hold':'HOLD','rev':'REV'}.get(stage,'')
-            cal_status_display(mode_name, air, t_sample, stage)
+            if (air is not None) and (t_sample is not None): show_two_line(f'Cal {mode_name} {tag}'[:16], f'A:{air:.1f} S:{t_sample:.1f}')
+            else: show_two_line(f'Cal {mode_name}'[:16],'Waiting temps')
             fans_on_state=(fan1.value>0) or (fan2.value>0); log_data(f'CAL-{mode_name}',t1,t2,t_sample,stage,motor_on,motor_dir.value,fans_on_state,reversing)
             _emergency_reverse_guard(air,high)
             if not reversing:
@@ -304,17 +274,20 @@ def run_calibration(mode_name,low,high):
                             motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); schedule_fan_off()
                         if (not motor_on) and tmax<=low:
                             motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
+            # Buffers
             if air is not None: air_buf.append(air)
             if t_sample is not None: sample_buf.append(t_sample)
-            # Early end: Sample >= target for configured stability
+            # Early end: Sample in target band for configured stability
+            target_low = target - 0.5; target_high = target + 0.5
             now_ts=time.time(); dt=now_ts-last_ts; last_ts=now_ts
-            in_band = (t_sample is not None) and (t_sample >= target)
+            in_band = (t_sample is not None) and (t_sample>=target_low) and (t_sample<=target_high)
             stable_secs = stable_secs + dt if in_band else 0.0
             # Finish conditions
             elapsed=time.time()-start_ts
             required_stable = max(0, CAL_EARLY_END_STABLE_MIN) * 60
             if finish_requested or elapsed >= CAL_WINDOW_MIN*60 or (CAL_EARLY_END_ENABLED and stable_secs >= required_stable and in_band):
                 break
+            # Pause & pacing
             for _ in range(int(LOOP_INTERVAL_SEC/0.1)):
                 if finish_requested: break
                 if request_pause_menu:
@@ -330,7 +303,7 @@ def run_calibration(mode_name,low,high):
         center=target+offset; half=RECOMMENDED_BAND_WIDTH/2.0; rec_low,rec_high=center-half,center+half
         save_calibration_setpoints(mode_name,rec_low,rec_high); RANGES[mode_name]=(rec_low,rec_high)
         write_calibration_report(mode_name,target,air_avg,sample_avg,offset,rec_low,rec_high)
-        show_two_line('Cal saved+applied', f'L:{rec_low:.1f} H:{rec_high:.1f}'); time.sleep(2); return 'autostart'
+        show_two_line('Cal saved+applied', f'L:{rec_low:.1f} H:{rec_high:.1f}'); time.sleep(4); return 'change'
     finally:
         button_confirm.when_pressed=old
 
@@ -359,9 +332,5 @@ def main():
         elif sel[0]=='cal':
             _,mode_name,low,high=sel; result=run_calibration(mode_name,low,high)
             if result=='shutdown': return
-            if result=='autostart':
-                low, high = RANGES.get(mode_name, (low, high))
-                res2 = run_mode(mode_name, low, high)
-                if res2=='shutdown': return
 
 if __name__=='__main__': main()

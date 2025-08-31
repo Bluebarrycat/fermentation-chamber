@@ -1,13 +1,37 @@
 # Change Log
 
+## 2025-08-10
+- Sample sensor added
+- Calibration window changed from 60 → 120 minutes
+- Pause menu introduced
+- Fan speed set to 75%
+- Samba log path confirmed
 
-## 2025-08-30
-- Calibration report cleanup now matches files **case-insensitively** to avoid missed deletions.
+## 2025-08-14
+- Calibration auto-finishes at 120 minutes
+- Confirm button made edge-triggered
+- Calibration results auto-save setpoints
 
-- Calibration report cleanup is now **scoped per product** (e.g., only `calibration_sourdough*.txt`).
+## 2025-08-15
+- Calibration window extended to 180 minutes for all modes
+- CALIBRATION_GUIDE.md updated accordingly
 
-- Early calibration end refined to **Sample ≥ target** (not bottom of band).
-- Deletes prior `calibration_*.txt` files at calibration start.
-- Auto-starts **normal mode** after calibration completes (set-and-forget).
+## 2025-08-16
+- Add two-phase Boost→Hold control (AIR-based) in production and calibration
+  - Boost enters when AIR is far below band center; exits near center
+  - Safety cap during Boost: `BOOST_MAX_AIR_C` (default 31.0 °C)
+  - Sample remains read-only for control; used only in calibration math
+- Set calibration window default to **200 minutes** across modes
 
-- LCD now shows **A:xx.x S:yy.y** during calibration (AIR vs Sample), with stage tag on the first line.
+## 2025-08-16
+- Add two-phase Boost→Hold control (AIR-based) in production and calibration
+  - Boost enters when AIR is far below band center; exits near center
+  - Safety cap during Boost: `BOOST_MAX_AIR_C` (default 31.0 °C)
+  - Sample remains read-only for control; used only in calibration math
+- Set calibration window default to **200 minutes** across modes
+- Updated sourdough calibration target in `main.py`:
+  - `CAL_TARGET_C['Sourdough']` changed from 25.0 °C → 27.0 °C
+
+## 2025-08-17
+- Add 3-stage warm-up with AIR ceiling 34 °C and fans-only cool-down.
+- Calibration can now **end early** when Sample reaches target band (±0.5 °C), controlled by `CAL_EARLY_END_ENABLED` and `CAL_EARLY_END_STABLE_MIN`.
