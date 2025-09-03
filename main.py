@@ -319,11 +319,11 @@ def run_calibration(mode_name,low,high):
             if not reversing:
                 if stage=='startup':
                     if (t_sample is not None) and (t_sample>=sample_exit_c):
-                    logger.info('Stage transition: startup -> cooldown (Sample %.2f reached %.2f)', t_sample, sample_exit_c)
+                        logger.info('Stage transition: startup -> cooldown (Sample %.2f reached %.2f)', t_sample, sample_exit_c)
                         motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); stage='cooldown'
                     else:
                         if (air is not None) and (air>=startup_ceiling):
-                        logger.debug('Startup ceiling reached: air=%.2f >= %.2f; motor OFF, fans ON', air, startup_ceiling)
+                            logger.debug('Startup ceiling reached: air=%.2f >= %.2f; motor OFF, fans ON', air, startup_ceiling)
                             motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
                         else:
                             motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
