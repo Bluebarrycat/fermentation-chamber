@@ -35,4 +35,7 @@
 
 ## 2025-09-02
 - Fix: initialize category loggers inside `_setup_logger()` to avoid `_NoopLogger.getChild` error.
-- Docs overhaul: completed **HARDWARE_MAP.md**, expanded **DESIGN_DECISIONS.md** and **CALIBRATION_GUIDE.md**, updated **PROJECT_MAP.md**, refined **README.md**, added **TROUBLESHOOTING.md**, **SYNC_WORKFLOW.md**, **AI_COLLAB.md**, and **TEMPLATES.md**. 
+- Docs overhaul: completed **HARDWARE_MAP.md**, expanded **DESIGN_DECISIONS.md** and **CALIBRATION_GUIDE.md**, updated **PROJECT_MAP.md**, refined **README.md**, added **TROUBLESHOOTING.md**, **SYNC_WORKFLOW.md**, **AI_COLLAB.md**, and **TEMPLATES.md**.
+
+## 2025-09-02
+- **Auto-start after calibration**: After a successful calibration save, the controller now automatically starts the corresponding production mode using the newly applied setpoints (no return to main menu).

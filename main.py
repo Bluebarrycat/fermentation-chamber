@@ -392,7 +392,7 @@ def run_calibration(mode_name,low,high):
         center=target+offset; half=RECOMMENDED_BAND_WIDTH/2.0; rec_low,rec_high=center-half,center+half
         save_calibration_setpoints(mode_name,rec_low,rec_high); RANGES[mode_name]=(rec_low,rec_high); log_cal.info('Applied setpoints for %s: L=%.2f H=%.2f', mode_name, rec_low, rec_high)
         write_calibration_report(mode_name,target,air_avg,sample_avg,offset,rec_low,rec_high); log_io.debug('Wrote calibration report file')
-        show_two_line('Cal saved+applied', f'L:{rec_low:.1f} H:{rec_high:.1f}'); time.sleep(4); return 'change'
+        show_two_line('Cal saved+applied', f'L:{rec_low:.1f} H:{rec_high:.1f}'); time.sleep(4); return ('autostart', mode_name)
     finally:
         button_confirm.when_pressed=old
 
