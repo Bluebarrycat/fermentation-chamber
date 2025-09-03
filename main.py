@@ -333,10 +333,10 @@ def run_calibration(mode_name,low,high):
                 else:
                     if tmax is not None:
                         if motor_on and tmax>high:
-                        logger.debug('Hold: tmax %.2f > high %.2f => motor OFF, fans purge', tmax, high)
+                            logger.debug('Hold: tmax %.2f > high %.2f => motor OFF, fans purge', tmax, high)
                             motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); schedule_fan_off()
                         if (not motor_on) and tmax<=low:
-                        logger.debug('Hold: tmax %.2f <= low %.2f => motor ON', tmax, low)
+                            logger.debug('Hold: tmax %.2f <= low %.2f => motor ON', tmax, low)
                             motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
             # Buffers
             if air is not None: air_buf.append(air)
