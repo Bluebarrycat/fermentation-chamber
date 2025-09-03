@@ -21,7 +21,7 @@ DEBUG = True  # Set to False to turn off debug logs
 import logging
 
 def _setup_logger():
-    global logger
+    global logger, log_sensor, log_buttons, log_mode, log_cal, log_motor, log_fan, log_emerg, log_ui, log_io, log_sys
     logger = logging.getLogger("ferment")
     # Ensure log directory exists
     debug_dir = os.path.join(LOG_DIR, "debug")
@@ -41,6 +41,17 @@ def _setup_logger():
     fh.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     ch.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     logger.debug("Debug logging initialized. DEBUG=%s", DEBUG)
+    # Initialize category loggers
+    log_sensor = logger.getChild('sensor')
+    log_buttons = logger.getChild('buttons')
+    log_mode   = logger.getChild('mode')
+    log_cal    = logger.getChild('cal')
+    log_motor  = logger.getChild('motor')
+    log_fan    = logger.getChild('fan')
+    log_emerg  = logger.getChild('emerg')
+    log_ui     = logger.getChild('ui')
+    log_io     = logger.getChild('io')
+    log_sys    = logger.getChild('sys')
 
 # Placeholder in case logger is referenced before setup (minimal no-op logger)
 class _NoopLogger:
@@ -52,17 +63,17 @@ class _NoopLogger:
 
 logger = _NoopLogger()
 
-# --- Category loggers (for clearer labels) ---
-log_sensor = logger.getChild("sensor")
-log_buttons = logger.getChild("buttons")
-log_mode   = logger.getChild("mode")
-log_cal    = logger.getChild("cal")
-log_motor  = logger.getChild("motor")
-log_fan    = logger.getChild("fan")
-log_emerg  = logger.getChild("emerg")
-log_ui     = logger.getChild("ui")
-log_io     = logger.getChild("io")
-log_sys    = logger.getChild("sys")
+# --- Category loggers (placeholders until _setup_logger runs) ---
+log_sensor = logger
+log_buttons = logger
+log_mode   = logger
+log_cal    = logger
+log_motor  = logger
+log_fan    = logger
+log_emerg  = logger
+log_ui     = logger
+log_io     = logger
+log_sys    = logger
 
 
 
