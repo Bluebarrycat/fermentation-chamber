@@ -111,3 +111,11 @@ Example line:
 ```
 2025-09-02 21:07:11 [INFO   ] [ferment.mode ] Sourdough: startup → cooldown (Sample 27.1 ≥ 27.0)
 ```
+
+
+### Safety thresholds
+- Emergency reverse (AIR): instant at **36.0 °C**, or sustained **34.5 °C** for **60 s**.
+- Fan run-on after motor stop: **10 s**.
+
+### Windows access to logs
+You can access logs from Windows at: `\\rpizero\ferment-logs` (Samba network share).
