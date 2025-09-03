@@ -35,3 +35,9 @@
 ## 2025-08-17
 - Add 3-stage warm-up with AIR ceiling 34 °C and fans-only cool-down.
 - Calibration can now **end early** when Sample reaches target band (±0.5 °C), controlled by `CAL_EARLY_END_ENABLED` and `CAL_EARLY_END_STABLE_MIN`.
+
+## 2025-09-02
+- **Debug Mode** added (enabled by default). Toggle via single line in `main.py`:
+  - `DEBUG = True` → verbose logs ON (console + daily file under `logs/debug/debug_YYYY-MM-DD.log`).
+  - `DEBUG = False` → quiet (operational CSV logs only).
+- Instrumented key events: button presses, stage transitions, motor/fan actions, emergency reverse, early-end triggers, file I/O errors.

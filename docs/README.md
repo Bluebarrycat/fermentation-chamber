@@ -81,3 +81,14 @@ git push -u origin main
 - **Buttons not responding**: Ensure they’re wired to **GND** (since `gpiozero.Button` defaults to pull-up). If wired to 3.3V, change your code to `Button(pin, pull_up=False)`.
 - **DS18B20 not detected**: `ls /sys/bus/w1/devices/`; check sensor IDs match `SENSORS` in `main.py`.
 - **LCD not showing**: `i2cdetect -y 1` to confirm address `0x27`.
+
+
+## Debugging
+- Debugging is **enabled by default**. To disable, open `main.py` and set:
+  ```python
+  DEBUG = False
+  ```
+- Logs:
+  - Operational CSV: `/home/rpizero/Ferment/logs/YYYY-MM-DD.csv`
+  - Debug text files: `/home/rpizero/Ferment/logs/debug/debug_YYYY-MM-DD.log`
+- Typical entries include button presses, stage changes (startup/cooldown/hold), motor/fan actions, emergency reverse, calibration early-end triggers, and file I/O notices.
