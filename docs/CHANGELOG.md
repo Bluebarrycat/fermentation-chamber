@@ -41,3 +41,8 @@
   - `DEBUG = True` → verbose logs ON (console + daily file under `logs/debug/debug_YYYY-MM-DD.log`).
   - `DEBUG = False` → quiet (operational CSV logs only).
 - Instrumented key events: button presses, stage transitions, motor/fan actions, emergency reverse, early-end triggers, file I/O errors.
+
+## 2025-09-02
+- Structured logging: introduced category loggers (`ferment.sensor`, `ferment.mode`, `ferment.cal`, etc.) with clearer **levels** (DEBUG/INFO/WARNING/ERROR).
+- Updated formatter to include logger name for quick visual filtering.
+- Mapped events to categories: sensors/buttons/modes/calibration/fans/emergency/sys/io.

@@ -32,7 +32,7 @@ def _setup_logger():
     # Console handler
     ch = logging.StreamHandler()
     # Formatter
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)-7s] [%(name)-12s] %(message)s")
     fh.setFormatter(fmt); ch.setFormatter(fmt)
     # Avoid duplicate handlers if re-run
     logger.handlers.clear()
@@ -51,6 +51,19 @@ class _NoopLogger:
     def exception(self, *a, **k): pass
 
 logger = _NoopLogger()
+
+# --- Category loggers (for clearer labels) ---
+log_sensor = logger.getChild("sensor")
+log_buttons = logger.getChild("buttons")
+log_mode   = logger.getChild("mode")
+log_cal    = logger.getChild("cal")
+log_motor  = logger.getChild("motor")
+log_fan    = logger.getChild("fan")
+log_emerg  = logger.getChild("emerg")
+log_ui     = logger.getChild("ui")
+log_io     = logger.getChild("io")
+log_sys    = logger.getChild("sys")
+
 
 
 FAN_SPEED = 0.75
@@ -86,7 +99,7 @@ button_up=Button(17); button_down=Button(27); button_left=Button(23); button_rig
 motor_pwm = PWMOutputDevice(20); motor_dir = DigitalOutputDevice(21)
 fan1 = PWMOutputDevice(12); fan2 = PWMOutputDevice(13)
 motor_pwm.value=0.0; fan1.value=0.0; fan2.value=0.0; motor_dir.value=False
-logger.debug("GPIO initialized: motor PWM=20 DIR=21, fans PWM=12/13, buttons 17/27/23/22/26, LCD 0x27")
+log_sys.info("GPIO initialized: motor PWM=20 DIR=21, fans PWM=12/13, buttons 17/27/23/22/26, LCD 0x27")
 
 os.system('modprobe w1-gpio'); os.system('modprobe w1-therm')
 BASE_DIR='/sys/bus/w1/devices/'
@@ -108,9 +121,9 @@ def load_calibration_setpoints():
                 low=float(vals['low']); high=float(vals['high'])
                 if mode in RANGES and (low,high)!=RANGES[mode]: RANGES[mode]=(low,high); changed=True
         if changed:
-            logger.debug('Loaded calibration_setpoints.json and applied to ranges'); show_two_line('Loaded saved','cal setpoints'); time.sleep(1.2)
+            log_io.info('Loaded calibration_setpoints.json and applied to ranges'); show_two_line('Loaded saved','cal setpoints'); time.sleep(1.2)
     except Exception:
-        logger.warning('Calibration setpoints file load error; using defaults'); show_two_line('Cal file error','Using defaults'); time.sleep(1.5)
+        log_io.warning('Calibration setpoints file load error; using defaults'); show_two_line('Cal file error','Using defaults'); time.sleep(1.5)
 
 def save_calibration_setpoints(mode_name, low, high):
     data={}
@@ -118,7 +131,7 @@ def save_calibration_setpoints(mode_name, low, high):
         try:
             with open(CAL_FILE,'r') as f: data=json.load(f)
         except Exception: data={}
-    data[mode_name]={'low':round(low,2),'high':round(high,2)}; logger.debug('Persisting cal setpoints for %s: low=%.2f high=%.2f', mode_name, low, high)
+    data[mode_name]={'low':round(low,2),'high':round(high,2)}; log_io.info('Persisting cal setpoints for %s: low=%.2f high=%.2f', mode_name, low, high)
     tmp=CAL_FILE+'.tmp'
     with open(tmp,'w') as f: json.dump(data,f,indent=2)
     os.replace(tmp,CAL_FILE)
@@ -165,23 +178,23 @@ def read_temp(sensor_id):
     try:
         with open(path) as f: lines=f.readlines()
         if not lines or lines[0].strip().endswith('NO'):
-            logger.debug('read_temp CRC/NO for %s', sensor_id); return None
+            log_sensor.warning('CRC/NO for %s', sensor_id); return None
         t_pos=lines[1].find('t=')
         if t_pos==-1:
-            logger.debug('read_temp parse error for %s: no t=', sensor_id); return None
-        val = round(float(lines[1][t_pos+2:])/1000.0,2); logger.debug('read_temp %s = %.2f C', sensor_id, val); return val
+            log_sensor.warning('read_temp parse error for %s: no t=', sensor_id); return None
+        val = round(float(lines[1][t_pos+2:])/1000.0,2); log_sensor.debug('%s = %.2f C', sensor_id, val); return val
     except Exception as e:
-        logger.debug('read_temp exception for %s: %s', sensor_id, e); return None
+        log_sensor.error('read_temp exception for %s: %s', sensor_id, e); return None
 
 def fans_on():
-    fan1.value=FAN_SPEED; fan2.value=FAN_SPEED; logger.debug('Fans ON at duty=%.2f', FAN_SPEED)
+    fan1.value=FAN_SPEED; fan2.value=FAN_SPEED; log_fan.debug('Fans ON at duty=%.2f', FAN_SPEED)
 def fans_off():
-    fan1.value=0.0; fan2.value=0.0; logger.debug('Fans OFF')
+    fan1.value=0.0; fan2.value=0.0; log_fan.debug('Fans OFF')
 def cancel_fan_timer():
     global fan_off_timer
     if fan_off_timer: fan_off_timer.cancel(); fan_off_timer=None
 def schedule_fan_off(delay=FAN_AFTER_OFF_SEC):
-    logger.debug('Scheduling fans OFF in %ds', delay)
+    log_fan.debug('Scheduling fans OFF in %ds', delay)
     global fan_off_timer
     cancel_fan_timer(); fan_off_timer=Timer(delay,fans_off); fan_off_timer.start()
 
@@ -196,11 +209,11 @@ def status_display(mode,t_air,stage,high):
 
 def wait_for_button_any():
     while True:
-        if button_up.is_pressed: logger.debug('Button pressed: UP'); time.sleep(0.2); return 'UP'
-        if button_down.is_pressed: logger.debug('Button pressed: DOWN'); time.sleep(0.2); return 'DOWN'
-        if button_left.is_pressed: logger.debug('Button pressed: LEFT'); time.sleep(0.2); return 'LEFT'
-        if button_right.is_pressed: logger.debug('Button pressed: RIGHT'); time.sleep(0.2); return 'RIGHT'
-        if button_confirm.is_pressed: logger.debug('Button pressed: CONFIRM'); time.sleep(0.2); return 'CONFIRM'
+        if button_up.is_pressed: log_buttons.debug('UP pressed'); time.sleep(0.2); return 'UP'
+        if button_down.is_pressed: log_buttons.debug('DOWN pressed'); time.sleep(0.2); return 'DOWN'
+        if button_left.is_pressed: log_buttons.debug('LEFT pressed'); time.sleep(0.2); return 'LEFT'
+        if button_right.is_pressed: log_buttons.debug('RIGHT pressed'); time.sleep(0.2); return 'RIGHT'
+        if button_confirm.is_pressed: log_buttons.debug('CONFIRM pressed'); time.sleep(0.2); return 'CONFIRM'
         time.sleep(0.05)
 
 def select_from_menu(options,initial_index=0,cancel_with_left=False):
@@ -213,23 +226,23 @@ def select_from_menu(options,initial_index=0,cancel_with_left=False):
         elif cancel_with_left and btn=='LEFT': return None
 
 def on_left_pressed():
-    logger.debug('LEFT pressed => pause menu request')
+    log_buttons.debug('LEFT pressed => pause menu request')
     global request_pause_menu; request_pause_menu=True
 button_left.when_pressed=on_left_pressed
 
 def safe_stop():
-    logger.info('Safe stop: motor OFF, fans OFF')
+    log_sys.info('Safe stop: motor OFF, fans OFF')
     global motor_on
     motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_off()
 def shutdown_now():
-    logger.info('Shutdown requested via menu/button')
+    log_sys.info('Shutdown requested via menu/button')
     log=get_log_file(); _write_header_if_needed(log)
     with open(log,'a',newline='') as f: csv.writer(f).writerow([datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'*** SHUTDOWN ***','','','','','','','',''])
-    safe_stop(); show_two_line('Shutting down',''); time.sleep(1); subprocess.call(['sudo','shutdown','now'])
+    safe_stop(); log_ui.info('LCD: Shutting down'); show_two_line('Shutting down',''); time.sleep(1); subprocess.call(['sudo','shutdown','now'])
 def pause_menu():
-    logger.debug('Entering pause menu')
+    log_buttons.debug('Entering pause menu')
     sel=select_from_menu(['Resume','Change Mode','Shutdown'],0,True)
-    choice = 'resume' if sel in (None,0) else ('change' if sel==1 else 'shutdown'); logger.debug('Pause menu choice: %s', choice); return choice
+    choice = 'resume' if sel in (None,0) else ('change' if sel==1 else 'shutdown'); log_buttons.info('Pause choice: %s', choice); return choice
 
 def _read_air_and_sample():
     t1=read_temp(SENSORS['Sensor1']); t2=read_temp(SENSORS['Sensor2']); t_sample=read_temp(SENSORS['Sample'])
@@ -241,17 +254,17 @@ def _emergency_reverse_guard(air,high):
     if air is None: return
     now=time.time()
     if air>=EMERGENCY_INSTANT_AIR_C and not reversing:
-        logger.warning('Emergency reverse (instant): air=%.2f >= %.2f', air, EMERGENCY_INSTANT_AIR_C)
+        log_emerg.warning('Emergency reverse (instant): air=%.2f ≥ %.2f', air, EMERGENCY_INSTANT_AIR_C)
         reversing=True; motor_dir.value=not motor_dir.value; motor_pwm.value=1.0; cancel_fan_timer(); fans_on(); _overtemp_start_ts=None; return
     if air>=EMERGENCY_SUSTAIN_AIR_C:
         if _overtemp_start_ts is None: _overtemp_start_ts=now
         elif (now-_overtemp_start_ts)>=EMERGENCY_SUSTAIN_SEC and not reversing:
-            logger.warning('Emergency reverse (sustain): air=%.2f for >=%ds', air, EMERGENCY_SUSTAIN_SEC)
+            log_emerg.warning('Emergency reverse (sustain): air=%.2f for ≥%ds', air, EMERGENCY_SUSTAIN_SEC)
             reversing=True; motor_dir.value=not motor_dir.value; motor_pwm.value=1.0; cancel_fan_timer(); fans_on(); _overtemp_start_ts=None
     else:
         _overtemp_start_ts=None
     if reversing and air<=(high-1.0):
-        logger.info('Emergency reverse end: air=%.2f <= %.2f', air, (high-1.0))
+        log_emerg.info('Emergency reverse end: air=%.2f ≤ %.2f', air, (high-1.0))
         reversing=False; motor_pwm.value=0.0; schedule_fan_off(); motor_on=False; motor_dir.value=False
 
 def run_mode(mode_name,low,high):
@@ -266,14 +279,14 @@ def run_mode(mode_name,low,high):
         if not reversing:
             if stage=='startup':
                 if (t_sample is not None) and (t_sample>=sample_exit_c):
-                    logger.info('Stage transition: startup -> cooldown (Sample %.2f reached %.2f)', t_sample, sample_exit_c)
+                    log_mode.info('%s: startup → cooldown (Sample %.2f ≥ %.2f)', mode_name, t_sample, sample_exit_c)
                     motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); stage='cooldown'
                 else:
                     if (air is not None) and (air>=startup_ceiling):
-                        logger.debug('Startup ceiling reached: air=%.2f >= %.2f; motor OFF, fans ON', air, startup_ceiling)
+                        log_mode.debug('Startup ceiling: air=%.2f ≥ %.2f → motor OFF, fans ON', air, startup_ceiling)
                         motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
                     else:
-                        logger.debug('Startup heating: motor ON (dir A), fans ON');
+                        log_mode.debug('Startup heating: motor ON (A), fans ON');
                         motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
             elif stage=='cooldown':
                 motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
@@ -281,10 +294,10 @@ def run_mode(mode_name,low,high):
             else:
                 if tmax is not None:
                     if motor_on and tmax>high:
-                        logger.debug('Hold: tmax %.2f > high %.2f => motor OFF, fans purge', tmax, high)
+                        log_mode.debug('Hold: tmax %.2f > high %.2f → motor OFF, purge', tmax, high)
                         motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); schedule_fan_off()
                     if (not motor_on) and tmax<=low:
-                        logger.debug('Hold: tmax %.2f <= low %.2f => motor ON', tmax, low)
+                        log_mode.debug('Hold: tmax %.2f ≤ low %.2f → motor ON', tmax, low)
                         motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
         for _ in range(int(LOOP_INTERVAL_SEC/0.1)):
             if request_pause_menu:
@@ -319,11 +332,11 @@ def run_calibration(mode_name,low,high):
             if not reversing:
                 if stage=='startup':
                     if (t_sample is not None) and (t_sample>=sample_exit_c):
-                        logger.info('Stage transition: startup -> cooldown (Sample %.2f reached %.2f)', t_sample, sample_exit_c)
+                        log_mode.info('%s: startup → cooldown (Sample %.2f ≥ %.2f)', mode_name, t_sample, sample_exit_c)
                         motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); stage='cooldown'
                     else:
                         if (air is not None) and (air>=startup_ceiling):
-                            logger.debug('Startup ceiling reached: air=%.2f >= %.2f; motor OFF, fans ON', air, startup_ceiling)
+                            log_mode.debug('Startup ceiling: air=%.2f ≥ %.2f → motor OFF, fans ON', air, startup_ceiling)
                             motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on()
                         else:
                             motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
@@ -333,10 +346,10 @@ def run_calibration(mode_name,low,high):
                 else:
                     if tmax is not None:
                         if motor_on and tmax>high:
-                            logger.debug('Hold: tmax %.2f > high %.2f => motor OFF, fans purge', tmax, high)
+                            log_mode.debug('Hold: tmax %.2f > high %.2f → motor OFF, purge', tmax, high)
                             motor_pwm.value=0.0; motor_on=False; cancel_fan_timer(); fans_on(); schedule_fan_off()
                         if (not motor_on) and tmax<=low:
-                            logger.debug('Hold: tmax %.2f <= low %.2f => motor ON', tmax, low)
+                            log_mode.debug('Hold: tmax %.2f ≤ low %.2f → motor ON', tmax, low)
                             motor_dir.value=False; motor_pwm.value=1.0; motor_on=True; cancel_fan_timer(); fans_on()
             # Buffers
             if air is not None: air_buf.append(air)
@@ -350,7 +363,7 @@ def run_calibration(mode_name,low,high):
             elapsed=time.time()-start_ts
             required_stable = max(0, CAL_EARLY_END_STABLE_MIN) * 60
             if finish_requested or elapsed >= CAL_WINDOW_MIN*60 or (CAL_EARLY_END_ENABLED and stable_secs >= required_stable and in_band):
-                logger.info('Calibration finishing: finish_requested=%s, elapsed=%.1fs, early_end=%s (stable_secs=%.1f >= %ds, in_band=%s)', finish_requested, elapsed, CAL_EARLY_END_ENABLED and stable_secs >= required_stable and in_band, stable_secs, required_stable, in_band)
+                log_cal.info('Finish: requested=%s, elapsed=%.0fs, early_end=%s (stable=%.0fs≥%ds, in_band=%s)', finish_requested, elapsed, CAL_EARLY_END_ENABLED and stable_secs >= required_stable and in_band, stable_secs, required_stable, in_band)
                 break
             # Pause & pacing
             for _ in range(int(LOOP_INTERVAL_SEC/0.1)):
@@ -366,8 +379,8 @@ def run_calibration(mode_name,low,high):
             show_two_line('Cal failed','No data'); time.sleep(2); return 'change'
         air_avg=mean(air_buf); sample_avg=mean(sample_buf); offset=air_avg-sample_avg
         center=target+offset; half=RECOMMENDED_BAND_WIDTH/2.0; rec_low,rec_high=center-half,center+half
-        save_calibration_setpoints(mode_name,rec_low,rec_high); RANGES[mode_name]=(rec_low,rec_high); logger.info('Calibration applied for %s: Low=%.2f High=%.2f', mode_name, rec_low, rec_high)
-        write_calibration_report(mode_name,target,air_avg,sample_avg,offset,rec_low,rec_high)
+        save_calibration_setpoints(mode_name,rec_low,rec_high); RANGES[mode_name]=(rec_low,rec_high); log_cal.info('Applied setpoints for %s: L=%.2f H=%.2f', mode_name, rec_low, rec_high)
+        write_calibration_report(mode_name,target,air_avg,sample_avg,offset,rec_low,rec_high); log_io.debug('Wrote calibration report file')
         show_two_line('Cal saved+applied', f'L:{rec_low:.1f} H:{rec_high:.1f}'); time.sleep(4); return 'change'
     finally:
         button_confirm.when_pressed=old
@@ -382,22 +395,22 @@ def main_menu():
             choice=MENU[idx]
             if choice=='Shutdown': shutdown_now(); return ('shutdown',)
             elif choice.startswith('Cal '):
-                base=choice.replace('Cal ',''); low,high=RANGES[base]; return ('cal',base,low,high)
+                base=choice.replace('Cal ',''); low,high=RANGES[base]; log_mode.debug('Menu: select calibration %s (L=%.2f H=%.2f)', base, low, high); return ('cal',base,low,high)
             else:
-                low,high=RANGES[choice]; return ('mode',choice,low,high)
+                low,high=RANGES[choice]; log_mode.debug('Menu: select mode %s (L=%.2f H=%.2f)', choice, low, high); return ('mode',choice,low,high)
 
 def main():
-    logger.info('Fermentation Controller starting...')
-    load_calibration_setpoints(); init_log(); logger.info('Main menu ready')
+    log_sys.info('Fermentation Controller starting...')
+    load_calibration_setpoints(); init_log(); log_sys.info('Main menu ready')
     while True:
         sel=main_menu()
         if sel[0]=='shutdown': return
         if sel[0]=='mode':
-            logger.info('Starting mode: %s (Low=%.2f High=%.2f)', sel[1], sel[2], sel[3])
+            log_mode.info('Start mode: %s (Low=%.2f High=%.2f)', sel[1], sel[2], sel[3])
             _,mode_name,low,high=sel; result=run_mode(mode_name,low,high)
             if result=='shutdown': return
         elif sel[0]=='cal':
-            logger.info('Starting calibration: %s (Low=%.2f High=%.2f)', sel[1], sel[2], sel[3])
+            log_cal.info('Start calibration: %s (Low=%.2f High=%.2f)', sel[1], sel[2], sel[3])
             _,mode_name,low,high=sel; result=run_calibration(mode_name,low,high)
             if result=='shutdown': return
 

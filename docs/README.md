@@ -92,3 +92,22 @@ git push -u origin main
   - Operational CSV: `/home/rpizero/Ferment/logs/YYYY-MM-DD.csv`
   - Debug text files: `/home/rpizero/Ferment/logs/debug/debug_YYYY-MM-DD.log`
 - Typical entries include button presses, stage changes (startup/cooldown/hold), motor/fan actions, emergency reverse, calibration early-end triggers, and file I/O notices.
+
+
+### Debug log categories
+Loggers are grouped so you can quickly spot the source:
+- `ferment.sensor` — DS18B20 reads and validation
+- `ferment.buttons` — button presses and pause menu
+- `ferment.mode` — production stages and band decisions
+- `ferment.cal` — calibration flow and setpoints persistence
+- `ferment.motor` — motor actions (reserved; most actions appear in `mode`)
+- `ferment.fan` — fans and purge timers
+- `ferment.emerg` — emergency reverse
+- `ferment.ui` — key LCD messages
+- `ferment.io` — file I/O (setpoints, reports)
+- `ferment.sys` — startup/shutdown and GPIO init
+
+Example line:
+```
+2025-09-02 21:07:11 [INFO   ] [ferment.mode ] Sourdough: startup → cooldown (Sample 27.1 ≥ 27.0)
+```
